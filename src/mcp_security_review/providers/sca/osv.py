@@ -354,6 +354,9 @@ _ECOSYSTEM_MAP = {
     "csharp": "NuGet",
     "rubygems": "RubyGems",
     "ruby": "RubyGems",
+    "github-actions": "GitHub Actions",
+    "actions": "GitHub Actions",
+    "gha": "GitHub Actions",
 }
 
 

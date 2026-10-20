@@ -63,12 +63,17 @@ class FetchError(Exception):
 
     Codes: `timeout`, `connect_failed`, `http_<status>`, `rate_limited`,
     `response_too_large`, `invalid_json`, `unsafe_host`, `too_many_redirects`.
+    For `http_<status>` and `rate_limited`, `headers` holds the response
+    headers (an OCI registry's 401 carries its token challenge there).
     """
 
-    def __init__(self, code: str, message: str = "") -> None:
-        """Store the failure code and an optional human-readable message."""
+    def __init__(
+        self, code: str, message: str = "", headers: httpx.Headers | None = None
+    ) -> None:
+        """Store the failure code, an optional message, and response headers."""
         super().__init__(message or code)
         self.code = code
+        self.headers = headers if headers is not None else httpx.Headers()
 
 
 def new_client(timeout: float = 15.0) -> httpx.AsyncClient:
@@ -170,10 +175,12 @@ async def _fetch(
                 current = target
                 continue
             if resp.status_code == 429:
-                raise FetchError("rate_limited", "upstream returned 429")
+                raise FetchError(
+                    "rate_limited", "upstream returned 429", headers=resp.headers
+                )
             if resp.status_code >= 400:
                 code = f"http_{resp.status_code}"
-                raise FetchError(code)
+                raise FetchError(code, headers=resp.headers)
             body = await _read_capped(resp, max_bytes)
         finally:
             await resp.aclose()

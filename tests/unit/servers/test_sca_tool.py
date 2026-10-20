@@ -17,6 +17,10 @@ from mcp_security_review.providers.sca.osv import (
     Vulnerability,
     VulnerableFunction,
 )
+from mcp_security_review.providers.sca.registry import (
+    PackageRegistry,
+    PackageVerification,
+)
 from mcp_security_review.servers.main import main_mcp
 
 PKGS = json.dumps([{"name": "pyjwt", "version": "2.4.0", "ecosystem": "pypi"}])
@@ -400,3 +404,123 @@ async def test_lookup_preserves_request_order_under_concurrency() -> None:
         "CVE-2021-44228",
         "CVE-2021-44229",
     ]
+
+
+# ---- GitHub Actions and container images ----
+
+_FIX = "actions/checkout@" + "1" * 40 + " # v4"
+
+
+async def verify(results: list[PackageVerification]) -> dict[str, Any]:
+    async def fake(self: PackageRegistry, packages: list[dict]) -> list:
+        return results
+
+    with patch.object(PackageRegistry, "verify_packages", fake):
+        return await call_tool("sca_verify_packages", packages_json=PKGS)
+
+
+def _pv(**kw: Any) -> PackageVerification:
+    base: dict[str, Any] = {
+        "name": "actions/checkout",
+        "version": "v4",
+        "ecosystem": "github-actions",
+        "exists": True,
+        "version_exists": True,
+    }
+    base.update(kw)
+    return PackageVerification(**base)
+
+
+@pytest.mark.anyio
+async def test_tool_returns_unpinned_array() -> None:
+    data = await verify(
+        [
+            _pv(pinned=False, suggested_fix=_FIX),
+            _pv(version="1" * 40, pinned=True),
+            _pv(name="requests", version="2.31.0", ecosystem="pypi"),
+        ]
+    )
+    assert data["all_valid"] is True
+    assert data["packages_checked"] == 3
+    assert [u["suggested_fix"] for u in data["unpinned"]] == [_FIX]
+    assert data["unpinned"][0]["pinned"] is False
+    assert "action_required" in data
+
+
+@pytest.mark.anyio
+async def test_tool_unpinned_alongside_invalid() -> None:
+    data = await verify(
+        [
+            _pv(pinned=False, suggested_fix=_FIX),
+            _pv(name="actions/nope", exists=False, version_exists=False),
+        ]
+    )
+    assert data["all_valid"] is False
+    assert [p["name"] for p in data["invalid_packages"]] == ["actions/nope"]
+    assert data["unpinned"][0]["suggested_fix"] == _FIX
+
+
+@pytest.mark.anyio
+async def test_tool_lists_unverified_without_failing() -> None:
+    data = await verify(
+        [
+            _pv(
+                name="internal.corp/app",
+                ecosystem="container",
+                exists=None,
+                version_exists=None,
+                status="unsafe_host",
+            ),
+            _pv(version="e" * 40, version_exists=None, status="unverified_sha"),
+        ]
+    )
+    assert data["all_valid"] is True
+    assert [u["status"] for u in data["unverified"]] == [
+        "unsafe_host",
+        "unverified_sha",
+    ]
+    assert "unpinned" not in data
+
+
+@pytest.mark.anyio
+async def test_tool_descriptions_list_new_ecosystems() -> None:
+    async with Client(main_mcp) as client:
+        tools = {t.name: t for t in await client.list_tools()}
+    for name in ("sca_verify_packages", "sca_scan_dependencies"):
+        described = json.dumps(tools[name].inputSchema)
+        for ecosystem in ("pypi", "npm", "github-actions"):
+            assert ecosystem in described, (name, ecosystem)
+    assert "container" in json.dumps(tools["sca_verify_packages"].inputSchema)
+
+
+@pytest.mark.anyio
+async def test_scan_accepts_github_actions_ecosystem() -> None:
+    seen: list[str] = []
+
+    async def fake_query(
+        self: OSVScanner, client: Any, name: str, version: str, ecosystem: str
+    ) -> list[Vulnerability]:
+        seen.append(ecosystem)
+        return []
+
+    packages = json.dumps(
+        [
+            {"name": "actions/checkout", "version": "v4", "ecosystem": eco}
+            for eco in ("github-actions", "actions", "gha")
+        ]
+    )
+
+    async def sequential_scan(
+        self: OSVScanner, packages: list[dict]
+    ) -> list[ScanResult]:
+        # scan_packages fans out with asyncio.gather; run _scan_one in turn
+        # so this test also runs on trio.
+        return [await self._scan_one(None, pkg) for pkg in packages]  # type: ignore[arg-type]
+
+    with (
+        patch.object(OSVScanner, "_query_osv", fake_query),
+        patch.object(OSVScanner, "scan_packages", sequential_scan),
+    ):
+        data = await call_tool("sca_scan_dependencies", packages_json=packages)
+    assert data["status"] == "clean"
+    assert seen == ["GitHub Actions"] * 3

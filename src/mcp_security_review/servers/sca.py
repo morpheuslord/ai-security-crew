@@ -33,6 +33,9 @@ _VULN_ID_RE = re.compile(
     r"|[A-Z][A-Z0-9]*-[A-Za-z0-9._:-]{1,64})$"
 )
 _MAX_LOOKUP_IDS = 20
+_UNVERIFIED_STATUSES = frozenset(
+    {"unverified_sha", "cannot_verify_anonymously", "unsafe_host"}
+)
 
 
 def _split_vulnerability_ids(raw: str) -> list[str]:
@@ -85,31 +88,41 @@ async def verify_packages(
         Field(
             description=(
                 "JSON array of packages to verify. Each object needs: "
-                "'name' (package name), 'version' (version string), "
-                "'ecosystem' ('pypi' or 'npm'). Example: "
-                '[{"name": "requests", "version": "2.31.0", '
-                '"ecosystem": "pypi"}]'
+                "'name', 'version', and 'ecosystem': 'pypi', 'npm', "
+                "'github-actions' (name 'owner/repo[/path]', version a tag, "
+                "branch, or commit SHA), or 'container' (name "
+                "'[registry/]repository', version a tag or sha256 digest). "
+                'Example: [{"name": "requests", "version": "2.31.0", '
+                '"ecosystem": "pypi"}, {"name": "actions/checkout", '
+                '"version": "v4", "ecosystem": "github-actions"}]'
             )
         ),
     ],
 ) -> str:
     """Verify that packages exist and their versions are valid.
 
-    Checks each package against its registry (PyPI, npm). For packages
-    that don't exist or have invalid versions, suggests corrections.
-    Returns only packages that need fixing — valid packages are silent.
+    Checks each package against its registry (PyPI, npm, GitHub for
+    Actions, the image's OCI registry for containers). For packages that
+    don't exist or have invalid versions, suggests corrections. Actions
+    and images referenced by a tag or branch are valid but listed under
+    `unpinned` with a `suggested_fix` that pins them to a commit SHA or
+    image digest.
 
-    Use this tool when an AI coding agent introduces new dependencies
-    to catch hallucinated or misspelled package names and versions.
+    Use this tool when an AI coding agent introduces new dependencies,
+    workflow actions, or base images to catch hallucinated or misspelled
+    names and versions.
 
     Args:
         ctx: The FastMCP context.
         packages_json: JSON array of package objects to verify.
 
     Returns:
-        JSON with 'all_valid' boolean and 'invalid_packages' list.
-        If all packages are valid, returns {"all_valid": true}.
-        If any are invalid, returns details and suggested fixes.
+        JSON with 'all_valid' (false only when something is definitely
+        missing or could not be checked) and 'packages_checked', plus
+        when relevant: 'invalid_packages' with suggested fixes, 'errors',
+        'unpinned' (valid but movable refs, each with 'suggested_fix'),
+        'unverified' (inconclusive checks, each with 'status' and
+        'note'), and 'action_required'.
     """
     packages = _parse_packages(packages_json)
     if isinstance(packages, str):
@@ -119,43 +132,44 @@ async def verify_packages(
     results = await registry.verify_packages(packages)
 
     failed = [r for r in results if r.error]
-    invalid = [r for r in results if not r.is_valid() and not r.error]
+    checked = [r for r in results if not r.error]
+    invalid = [r for r in checked if not r.is_valid()]
+    unpinned = [r for r in checked if r.is_valid() and r.pinned is False]
+    unverified = [r for r in checked if r.status in _UNVERIFIED_STATUSES]
 
-    if failed:
-        return json.dumps(
-            {
-                "all_valid": False,
-                "packages_checked": len(results),
-                "invalid_packages": [r.to_dict() for r in invalid],
-                "errors": [r.to_dict() for r in failed],
-                "action_required": (
-                    "Some packages could not be verified, which is not the same "
-                    "as invalid. Follow each error's hint."
-                ),
-            },
-            indent=2,
-            ensure_ascii=False,
-        )
-
-    if not invalid:
-        return json.dumps(
-            {
-                "all_valid": True,
-                "packages_checked": len(results),
-            },
-            indent=2,
-        )
-
-    response: dict = {
-        "all_valid": False,
+    response: dict[str, Any] = {
+        "all_valid": not failed and not invalid,
         "packages_checked": len(results),
-        "invalid_count": len(invalid),
-        "invalid_packages": [r.to_dict() for r in invalid],
-        "action_required": (
+    }
+    actions: list[str] = []
+    if failed:
+        response["invalid_packages"] = [r.to_dict() for r in invalid]
+        response["errors"] = [r.to_dict() for r in failed]
+        actions.append(
+            "Some packages could not be verified, which is not the same "
+            "as invalid. Follow each error's hint."
+        )
+    elif invalid:
+        response["invalid_count"] = len(invalid)
+        response["invalid_packages"] = [r.to_dict() for r in invalid]
+        actions.append(
             "Fix the invalid packages listed above. "
             "Use the suggested corrections where provided."
-        ),
-    }
+        )
+    if unpinned:
+        response["unpinned"] = [r.to_dict() for r in unpinned]
+        actions.append(
+            "Replace each unpinned reference with its suggested_fix: a tag "
+            "or branch can be moved to different code, a commit SHA or "
+            "image digest cannot."
+        )
+    if unverified:
+        response["unverified"] = [r.to_dict() for r in unverified]
+        actions.append(
+            "Entries under unverified are not confirmed missing; follow each note."
+        )
+    if actions:
+        response["action_required"] = " ".join(actions)
     return json.dumps(response, indent=2, ensure_ascii=False)
 
 
@@ -168,7 +182,8 @@ async def scan_dependencies(
             description=(
                 "JSON array of NEW packages to scan. Each object needs: "
                 "'name' (package name), 'version' (version string), "
-                "'ecosystem' ('pypi' or 'npm'). Example: "
+                "'ecosystem' ('pypi', 'npm', or 'github-actions' with name "
+                "'owner/repo' and the action's version). Example: "
                 '[{"name": "pyjwt", "version": "2.4.0", '
                 '"ecosystem": "pypi"}]'
             )
