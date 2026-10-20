@@ -61,20 +61,38 @@ class Library:
         return [m for m in self.countermeasures.values() if m.baseline]
 
     def menu(self) -> list[dict[str, str]]:
-        """Return the component menu shown to the agent."""
+        """Return the component menu shown to the agent.
+
+        Deprecated aliases are left out; they still resolve when passed.
+        """
         return [
             {"id": c.id, "name": c.name, "applies_when": c.applies_when}
             for c in self.components.values()
+            if not c.deprecated_alias_for
         ]
 
-    def expand(self, component_ids: list[str]) -> list[str]:
-        """Add implied components, keep order, and reject unknown ids."""
+    def unalias(self, component_ids: list[str]) -> list[str]:
+        """Replace deprecated aliases by the components they stand for.
+
+        Raises:
+            UnknownComponentError: If a component id is not in the library.
+        """
         unknown = [c for c in component_ids if c not in self.components]
         if unknown:
             raise UnknownComponentError(unknown, list(self.components))
+        replaced: list[str] = []
+        for component_id in component_ids:
+            targets = self.components[component_id].deprecated_alias_for
+            replaced.extend(targets or [component_id])
+        return list(dict.fromkeys(replaced))
 
+    def expand(self, component_ids: list[str]) -> list[str]:
+        """Add implied components, keep order, and reject unknown ids.
+
+        A deprecated alias is replaced by its components, as if they were picked.
+        """
         expanded: list[str] = []
-        pending = list(component_ids)
+        pending = self.unalias(component_ids)
         while pending:
             current = pending.pop(0)
             if current in expanded:
@@ -89,7 +107,8 @@ class Library:
         """Find the threats and countermeasures for the given components.
 
         Args:
-            component_ids: Components the feature involves.
+            component_ids: Components the feature involves. A deprecated alias
+                counts as picking each component it stands for.
             sensitive_data: Kinds of sensitive data handled, which raise the
                 risk level by one step.
 
@@ -101,8 +120,9 @@ class Library:
         Raises:
             UnknownComponentError: If a component id is not in the library.
         """
-        expanded = self.expand(component_ids)
-        picked = set(component_ids)
+        picked_ids = self.unalias(component_ids)
+        expanded = self.expand(picked_ids)
+        picked = set(picked_ids)
         selected = set(expanded)
 
         threats = [
@@ -132,7 +152,7 @@ class Library:
         )
         return Resolution(
             components=expanded,
-            picked=list(dict.fromkeys(component_ids)),
+            picked=picked_ids,
             threats=threats,
             also_consider=also_consider,
             countermeasures=[self.countermeasures[i] for i in ordered_ids],

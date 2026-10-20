@@ -106,6 +106,15 @@ def check_references(library: Library) -> None:
                 errors.append(
                     f"component '{c.id}' implies unknown component '{implied}'"
                 )
+        for target in c.deprecated_alias_for:
+            if target not in library.components:
+                errors.append(
+                    f"component '{c.id}' is an alias for unknown component '{target}'"
+                )
+            elif library.components[target].deprecated_alias_for:
+                errors.append(
+                    f"component '{c.id}' is an alias for another alias '{target}'"
+                )
     for t in library.threats.values():
         if not t.components:
             errors.append(f"threat '{t.id}' lists no components")
@@ -225,7 +234,14 @@ def _apply_disable(
     components = {k: v for k, v in components.items() if k not in disabled}
     countermeasures = {k: v for k, v in countermeasures.items() if k not in disabled}
     components = {
-        k: v.model_copy(update={"implies": [i for i in v.implies if i in components]})
+        k: v.model_copy(
+            update={
+                "implies": [i for i in v.implies if i in components],
+                "deprecated_alias_for": [
+                    i for i in v.deprecated_alias_for if i in components
+                ],
+            }
+        )
         for k, v in components.items()
     }
     kept: dict[str, Threat] = {}

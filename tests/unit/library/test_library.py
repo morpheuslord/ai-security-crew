@@ -7,13 +7,19 @@ import pytest
 from pydantic import ValidationError
 
 from mcp_security_review.library import (
+    LibraryError,
     Severity,
     UnknownComponentError,
     describe,
     load_library,
 )
 from mcp_security_review.library.library import Library
-from mcp_security_review.library.models import Threat
+from mcp_security_review.library.models import (
+    ComplianceRefs,
+    Countermeasure,
+    ScannerChecks,
+    Threat,
+)
 from mcp_security_review.providers.attack import PENDING_STATUS, AttackIndex
 
 ASVS_IDS = {
@@ -38,7 +44,8 @@ def test_builtin_library_is_not_empty(library: Library) -> None:
 
 def test_every_component_has_threats(library: Library) -> None:
     used = {c for t in library.threats.values() for c in t.components}
-    assert set(library.components) - used == set()
+    aliases = {c.id for c in library.components.values() if c.deprecated_alias_for}
+    assert set(library.components) - aliases - used == set()
 
 
 def test_every_countermeasure_is_used(library: Library) -> None:
@@ -172,7 +179,9 @@ def test_critical_stays_critical_with_sensitive_data(library: Library) -> None:
 
 def test_menu_lists_every_component(library: Library) -> None:
     menu = library.menu()
-    assert [m["id"] for m in menu] == list(library.components)
+    assert [m["id"] for m in menu] == [
+        c.id for c in library.components.values() if not c.deprecated_alias_for
+    ]
     assert all(m["applies_when"] for m in menu)
 
 
@@ -273,3 +282,259 @@ def test_describe_without_an_index_gives_ids_and_pending(library: Library) -> No
     # Threats without an ATT&CK mapping carry no attack field.
     unmapped = [t for t in view["threats"] if not library.threats[t["id"]].attack]
     assert all("attack" not in t for t in unmapped)
+
+
+# ---- Cloud, container, Kubernetes, and CI ----
+
+CLOUD_COMPONENTS = [
+    "cloud-network",
+    "cloud-compute",
+    "cloud-iam",
+    "cloud-storage",
+    "cloud-data-store",
+    "cloud-encryption-and-logging",
+    "container-image",
+    "kubernetes",
+    "ci-pipeline",
+]
+
+# AWS entries with no matching check in Trivy's catalogue (checked when the
+# entries were written). Every other AWS entry carries a Trivy id.
+NO_TRIVY_AWS_CHECK = {
+    "lb-access-logs",
+    "enforce-db-tls",
+    "instance-role-least-privilege",
+}
+
+
+def _cloud_entries(library: Library) -> tuple[list[Threat], list[Countermeasure]]:
+    threats = [
+        t for t in library.threats.values() if set(t.components) & set(CLOUD_COMPONENTS)
+    ]
+    ids = dict.fromkeys(m for t in threats for m in t.countermeasures)
+    return threats, [library.countermeasures[i] for i in ids]
+
+
+def test_new_components_exist(library: Library) -> None:
+    for component_id in CLOUD_COMPONENTS:
+        component = library.components[component_id]
+        assert "\n" not in component.applies_when
+        assert len(component.applies_when) <= 120, component_id
+    alias = library.components["container-and-iac"]
+    assert alias.deprecated_alias_for == CLOUD_COMPONENTS
+
+
+def test_alias_expands_as_picked(library: Library) -> None:
+    result = library.resolve(["container-and-iac"])
+
+    assert result.picked == CLOUD_COMPONENTS
+    assert library.expand(["container-and-iac"]) == CLOUD_COMPONENTS
+    ids = {t.id for t in result.threats}
+    assert "imds-credential-theft" in ids
+    assert {
+        "container-runs-as-root",
+        "secrets-baked-into-image",
+        "overbroad-cloud-permissions",
+        "exposed-data-store",
+    } <= ids
+    assert "imds-credential-theft" not in {t.id for t in result.also_consider}
+
+
+def test_alias_and_new_ids_resolve_alike(library: Library) -> None:
+    by_alias = library.resolve(["container-and-iac", "database"])
+    direct = library.resolve([*CLOUD_COMPONENTS, "database"])
+    assert [t.id for t in by_alias.threats] == [t.id for t in direct.threats]
+
+
+def test_alias_hidden_from_menu(library: Library) -> None:
+    ids = [m["id"] for m in library.menu()]
+    assert "container-and-iac" not in ids
+    assert set(CLOUD_COMPONENTS) <= set(ids)
+
+
+def test_moved_threats_use_the_new_components(library: Library) -> None:
+    threats = library.threats
+    used = {c for t in threats.values() for c in t.components}
+    assert "container-and-iac" not in used
+    assert "container-image" in threats["container-runs-as-root"].components
+    assert "kubernetes" in threats["container-runs-as-root"].components
+    assert "container-image" in threats["secrets-baked-into-image"].components
+    assert threats["overbroad-cloud-permissions"].components == ["cloud-iam"]
+    assert "cloud-data-store" in threats["exposed-data-store"].components
+
+
+def test_every_cloud_countermeasure_has_check_ids(library: Library) -> None:
+    _, measures = _cloud_entries(library)
+    assert len(measures) >= 30
+    for m in measures:
+        if m.providers == ["any"]:
+            continue
+        assert m.checks is not None, m.id
+        ids = m.checks.trivy + m.checks.checkov + m.checks.prowler + m.checks.kics
+        assert ids, m.id
+        joined = " ".join(ids)
+        if "aws" in m.providers:
+            assert m.checks.checkov and m.checks.prowler, m.id
+            assert any("AWS" in i for i in m.checks.trivy) or (
+                m.id in NO_TRIVY_AWS_CHECK
+            ), m.id
+        refs = m.compliance
+        if "azure" in m.providers:
+            assert "AZU" in joined or (refs and refs.cis_azure), m.id
+        if "gcp" in m.providers:
+            assert "GCP" in joined or (refs and refs.cis_gcp), m.id
+
+
+def test_aws_entries_cite_cis_where_the_benchmark_covers_them(
+    library: Library,
+) -> None:
+    _, measures = _cloud_entries(library)
+    aws = [m for m in measures if "aws" in m.providers]
+    cited = [m for m in aws if m.compliance and m.compliance.cis_aws]
+    assert len(cited) >= len(aws) // 2
+    imds = library.countermeasures["require-imdsv2"]
+    assert imds.compliance is not None
+    assert imds.compliance.cis_aws == ["6.7"]
+    assert imds.false_positives == (
+        "Scanners may flag aws_instance when metadata_options are set on the "
+        "launch template it uses."
+    )
+    assert "launch template" in (
+        library.countermeasures["encrypt-block-storage"].false_positives or ""
+    )
+
+
+def test_check_id_patterns_enforced(tmp_path: Path) -> None:
+    folder = tmp_path / ".ai-security-crew" / "library"
+    folder.mkdir(parents=True)
+    (folder / "bad.yaml").write_text(
+        "countermeasures:\n"
+        "  - id: bad-check\n"
+        "    name: Bad check\n"
+        "    how_to: Do it.\n"
+        "    effort: low\n"
+        "    checks:\n"
+        "      trivy: [AVD-XYZ-1]\n"
+        "      tfsec: [aws-ec2-x]\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(LibraryError) as info:
+        load_library(tmp_path)
+    joined = "\n".join(info.value.errors)
+    assert "checks.trivy" in joined
+    assert "tfsec" in joined
+
+
+def test_scanner_and_compliance_patterns() -> None:
+    good = ScannerChecks(
+        trivy=["AVD-AWS-0028", "AWS-0028", "AVD-KSV-0017", "AVD-DS-0002"],
+        checkov=["CKV_AWS_79", "CKV2_AWS_11", "CKV_K8S_16"],
+        prowler=["ec2_instance_imdsv2_enabled"],
+        kics=["c306ac53-ee5b-41d3-86a9-0fd2722b4e67"],
+    )
+    assert good.trivy[1] == "AWS-0028"
+    for field, bad in (
+        ("trivy", "AVD-XYZ-1"),
+        ("trivy", "AVD-AWS-28"),
+        ("checkov", "CKV-AWS-79"),
+        ("prowler", "EC2 IMDS"),
+        ("kics", "not-a-uuid"),
+    ):
+        with pytest.raises(ValidationError):
+            ScannerChecks(**{field: [bad]})
+    assert ComplianceRefs(cis_aws=["6.7", "3.1.4"], nist_800_53=["SC-7(5)"])
+    for field, bad in (("cis_aws", "6.x"), ("nist_800_53", "sc-7")):
+        with pytest.raises(ValidationError):
+            ComplianceRefs(**{field: [bad]})
+    with pytest.raises(ValidationError):
+        Countermeasure(
+            id="x", name="x", how_to="x", effort="low", false_positives="x" * 401
+        )
+    with pytest.raises(ValidationError):
+        Countermeasure(id="x", name="x", how_to="x", effort="low", providers=["oci"])
+
+
+REQUIRED_TOPICS = [
+    "imdsv2",
+    "hop limit",
+    "0.0.0.0/0",
+    "egress",
+    "public ip",
+    "block public access",
+    "publicly_accessible",
+    "access log",
+    "tls 1.2",
+    "kms",
+    "rotation",
+    "wildcard",
+    "instance profile",
+    "flow log",
+    "cloudtrail",
+    "log file validation",
+    "user data",
+    "force_ssl",
+    "verify-full",
+    "backup",
+    "deletion protection",
+    "point-in-time",
+    "state",
+    "non-root",
+    "digest",
+    "privileged",
+    "readonlyrootfilesystem",
+    "limits",
+    "networkpolicy",
+    "automountserviceaccounttoken",
+    "commit sha",
+    "permissions:",
+    "pull_request_target",
+    "oidc",
+]
+
+
+def test_required_topics_covered(library: Library) -> None:
+    threats, measures = _cloud_entries(library)
+    text = " ".join(
+        [t.name for t in threats] + [f"{m.name} {m.how_to}" for m in measures]
+    ).lower()
+    missing = [topic for topic in REQUIRED_TOPICS if topic not in text]
+    assert missing == []
+
+
+def test_ssm_wildcard_named(library: Library) -> None:
+    measures = library.resolve(["cloud-iam"]).countermeasures
+    iam = next(m for m in measures if m.id == "least-privilege-iam")
+    assert "ssm:*" in iam.how_to
+    assert 'Resource "*"' in iam.how_to
+
+
+# A few public scanner rule titles. Library text must be original wording, so
+# none of these may appear in a name or how_to.
+SCANNER_TITLES = [
+    "aws_instance should activate session tokens for Instance Metadata Service.",
+    "Ensure Instance Metadata Service Version 1 is not enabled",
+    "A security group rule should not allow unrestricted egress to any IP address.",
+    "Security groups should not allow unrestricted ingress to SSH or RDP from any IP "
+    "address.",
+    "An outdated SSL policy is in use by a load balancer.",
+    "Ensure the ELBv2 (Application/Network) has access logging enabled",
+    "A KMS key is not configured to auto-rotate.",
+    "Ensure rotation for customer created CMKs is enabled",
+    "Cloudtrail log validation should be enabled to prevent tampering of log data",
+    "Ensure VPC flow logging is enabled in all VPCs",
+    "Ensure all data stored in RDS is not publicly accessible",
+    "S3 Access block should block public ACL",
+    "Image user should not be 'root'",
+    "Containers should not run with allowPrivilegeEscalation",
+    "Ensure top-level permissions are not set to write-all",
+]
+
+
+def test_no_scanner_text_copied(library: Library) -> None:
+    for m in library.countermeasures.values():
+        text = f"{m.name} {m.how_to} {m.false_positives or ''}".lower()
+        for title in SCANNER_TITLES:
+            assert title.lower().rstrip(".") not in text, (m.id, title)
+    for t in library.threats.values():
+        for title in SCANNER_TITLES:
+            assert title.lower().rstrip(".") != t.name.lower(), (t.id, title)

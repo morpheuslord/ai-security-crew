@@ -325,12 +325,12 @@ threats:
   # ---- Object or file storage -----------------------------------------------
   - id: public-bucket
     name: Storage bucket is publicly listable or readable
-    components: [object-storage]
+    components: [object-storage, cloud-storage]
     severity: high
     stride: [information-disclosure]
     cwe: [CWE-732]
     attack: [T1530]
-    countermeasures: [private-storage-signed-urls]
+    countermeasures: [private-storage-signed-urls, block-public-storage-access]
 
   - id: long-lived-storage-credentials
     name: Long-lived storage keys are shipped to the browser or mobile app
@@ -639,10 +639,193 @@ threats:
     attack: [T1190]
     countermeasures: [scan-and-update-dependencies, pin-and-lock-dependencies]
 
-  # ---- Containers and infrastructure -----------------------------------------
+  # ---- Cloud network --------------------------------------------------------
+  - id: admin-ports-open-to-internet
+    name: SSH, RDP, or another admin port is open to 0.0.0.0/0 or ::/0
+    components: [cloud-network]
+    severity: high
+    stride: [spoofing, elevation-of-privilege]
+    cwe: [CWE-284]
+    attack: [T1133, T1021, T1110]
+    countermeasures: [restrict-admin-ingress]
+
+  - id: unrestricted-egress
+    name: Workloads may connect out to any address, so a compromised host can call home or exfiltrate freely
+    components: [cloud-network]
+    severity: medium
+    stride: [information-disclosure]
+    cwe: [CWE-284]
+    attack: [T1048, T1071, T1567]
+    countermeasures: [restrict-egress]
+
+  - id: public-ip-on-instance
+    name: A server gets a public IP address and is reachable straight from the internet
+    components: [cloud-network, cloud-compute]
+    severity: medium
+    stride: [information-disclosure, elevation-of-privilege]
+    cwe: [CWE-668]
+    attack: [T1190, T1133]
+    countermeasures: [no-public-ip-on-instances, restrict-admin-ingress]
+
+  - id: weak-load-balancer-tls
+    name: A load balancer listener accepts plain HTTP or old TLS versions and ciphers
+    components: [cloud-network]
+    severity: medium
+    stride: [information-disclosure, tampering]
+    cwe: [CWE-319, CWE-326]
+    attack: [T1557, T1040]
+    countermeasures: [lb-tls-policy]
+
+  - id: network-traffic-not-logged
+    name: Load balancer requests and network flows are not logged, so an incident cannot be traced
+    components: [cloud-network, cloud-encryption-and-logging]
+    severity: low
+    stride: [repudiation]
+    cwe: [CWE-778]
+    countermeasures: [lb-access-logs, vpc-flow-logs]
+
+  # ---- Cloud servers --------------------------------------------------------
+  - id: imds-credential-theft
+    name: An SSRF bug or code on a server reads the role credentials from the instance metadata service
+    components: [cloud-compute, cloud-iam]
+    severity: high
+    stride: [information-disclosure, elevation-of-privilege]
+    cwe: [CWE-522]
+    attack: [T1552.005]
+    countermeasures: [require-imdsv2, instance-role-least-privilege]
+
+  - id: secrets-in-iac-config
+    name: Secrets are written into user data, Terraform variables, outputs, or provider blocks
+    components: [cloud-compute, cloud-data-store, secrets-and-config]
+    severity: high
+    stride: [information-disclosure]
+    cwe: [CWE-798, CWE-312]
+    attack: [T1552.001, T1552.005]
+    countermeasures: [no-secrets-in-user-data-or-tf-config, secrets-manager]
+
+  - id: unencrypted-block-storage
+    name: Server disks and their snapshots are not encrypted, so a shared or copied snapshot exposes the data
+    components: [cloud-compute, cloud-encryption-and-logging]
+    severity: medium
+    stride: [information-disclosure]
+    cwe: [CWE-311]
+    attack: [T1537]
+    countermeasures: [encrypt-block-storage]
+
+  # ---- Cloud IAM ------------------------------------------------------------
+  - id: overbroad-cloud-permissions
+    name: Cloud roles or service accounts allow far more than the app needs
+    components: [cloud-iam]
+    severity: high
+    stride: [elevation-of-privilege]
+    cwe: [CWE-269]
+    attack: [T1078.004, T1098]
+    countermeasures: [least-privilege-iam]
+
+  - id: overbroad-instance-role
+    name: The role attached to a server or function can do far more than that workload needs
+    components: [cloud-iam, cloud-compute]
+    severity: high
+    stride: [elevation-of-privilege]
+    cwe: [CWE-250]
+    attack: [T1078.004, T1552.005]
+    countermeasures: [instance-role-least-privilege, least-privilege-iam]
+
+  - id: long-lived-cloud-keys
+    name: Long-lived cloud access keys sit in CI secrets or config instead of short-lived federated credentials
+    components: [ci-pipeline, cloud-iam]
+    severity: high
+    stride: [spoofing, information-disclosure]
+    cwe: [CWE-522]
+    attack: [T1078.004, T1552]
+    countermeasures: [ci-oidc-federation]
+
+  # ---- Cloud buckets --------------------------------------------------------
+  - id: unencrypted-bucket
+    name: Bucket objects are stored without a managed key or can be fetched over plain HTTP
+    components: [cloud-storage, cloud-encryption-and-logging]
+    severity: medium
+    stride: [information-disclosure]
+    cwe: [CWE-311, CWE-319]
+    attack: [T1530]
+    countermeasures: [encrypt-buckets-with-kms]
+
+  - id: bucket-changes-unrecoverable
+    name: Objects can be overwritten or deleted with no older version to restore and no access log to investigate
+    components: [cloud-storage]
+    severity: medium
+    stride: [tampering, repudiation]
+    cwe: [CWE-778]
+    attack: [T1485, T1486]
+    countermeasures: [bucket-versioning-and-access-logs]
+
+  # ---- Cloud databases and queues -------------------------------------------
+  - id: exposed-data-store
+    name: A database, cache, or admin port is reachable from the internet
+    components: [cloud-data-store, cloud-network, database]
+    severity: high
+    stride: [information-disclosure, tampering]
+    cwe: [CWE-668]
+    attack: [T1190]
+    countermeasures: [private-network-for-data-stores]
+
+  - id: database-tls-not-enforced
+    name: The database accepts unencrypted connections, or clients connect without checking its certificate
+    components: [cloud-data-store]
+    severity: medium
+    stride: [information-disclosure, tampering]
+    cwe: [CWE-319, CWE-295]
+    attack: [T1040, T1557]
+    countermeasures: [enforce-db-tls]
+
+  - id: unencrypted-data-store
+    name: Databases, queues, topics, secrets, or log groups are stored without a managed encryption key
+    components: [cloud-data-store, cloud-encryption-and-logging]
+    severity: medium
+    stride: [information-disclosure]
+    cwe: [CWE-311]
+    attack: [T1537]
+    countermeasures: [encrypt-databases-at-rest, encrypt-queues-topics-and-logs]
+
+  - id: data-store-loss
+    name: A database or table is deleted or corrupted with no backup, point-in-time recovery, or deletion protection
+    components: [cloud-data-store]
+    severity: high
+    stride: [denial-of-service, tampering]
+    attack: [T1485, T1486]
+    countermeasures: [db-backups-and-deletion-protection]
+
+  # ---- Cloud keys, audit logs, and state ------------------------------------
+  - id: cloud-audit-trail-gaps
+    name: Cloud API activity is not recorded in every region, or the audit log can be changed or deleted unnoticed
+    components: [cloud-encryption-and-logging, cloud-iam]
+    severity: medium
+    stride: [repudiation]
+    cwe: [CWE-778]
+    attack: [T1685.002]
+    countermeasures: [audit-trail-all-regions]
+
+  - id: kms-keys-unmanaged
+    name: Encryption keys never rotate, or their key policy lets any principal use or manage them
+    components: [cloud-encryption-and-logging]
+    severity: medium
+    stride: [information-disclosure, elevation-of-privilege]
+    cwe: [CWE-324, CWE-732]
+    countermeasures: [rotate-and-scope-kms-keys]
+
+  - id: terraform-state-exposed
+    name: Terraform state, which holds secrets in plain text, sits in a readable, unencrypted, or unlocked backend
+    components: [cloud-encryption-and-logging, cloud-storage, secrets-and-config]
+    severity: high
+    stride: [information-disclosure, tampering]
+    cwe: [CWE-312, CWE-538]
+    attack: [T1552.001, T1530]
+    countermeasures: [secure-terraform-state]
+
+  # ---- Container image ------------------------------------------------------
   - id: container-runs-as-root
     name: The container runs as root, so an app flaw becomes host-level access
-    components: [container-and-iac]
+    components: [container-image, kubernetes]
     severity: medium
     stride: [elevation-of-privilege]
     cwe: [CWE-250]
@@ -651,30 +834,85 @@ threats:
 
   - id: secrets-baked-into-image
     name: Secrets are copied into the image or passed as build arguments
-    components: [container-and-iac, secrets-and-config]
+    components: [container-image, secrets-and-config]
     severity: high
     stride: [information-disclosure]
     cwe: [CWE-540]
     attack: [T1552.001]
-    countermeasures: [secrets-manager]
+    countermeasures: [build-secrets-not-in-layers, secrets-manager]
 
-  - id: overbroad-cloud-permissions
-    name: Cloud roles or service accounts allow far more than the app needs
-    components: [container-and-iac]
+  - id: unpinned-base-image
+    name: Images are pulled by a mutable tag, so a rebuild or redeploy can silently get a different or poisoned image
+    components: [container-image, kubernetes]
+    severity: medium
+    stride: [tampering]
+    cwe: [CWE-494, CWE-829]
+    attack: [T1525, T1195.002]
+    countermeasures: [pin-images-by-digest]
+
+  # ---- Kubernetes -----------------------------------------------------------
+  - id: privileged-pod
+    name: A pod runs privileged, shares host namespaces, or has a writable root filesystem, making container escape easy
+    components: [kubernetes]
     severity: high
     stride: [elevation-of-privilege]
-    cwe: [CWE-269]
-    attack: [T1078.004, T1098]
-    countermeasures: [least-privilege-iam]
+    cwe: [CWE-250]
+    attack: [T1611, T1610]
+    countermeasures: [restrict-pod-security-context]
 
-  - id: exposed-data-store
-    name: A database, cache, or admin port is reachable from the internet
-    components: [container-and-iac, database]
+  - id: pod-without-resource-limits
+    name: A pod has no CPU or memory limits, so one workload or a miner can starve the node
+    components: [kubernetes]
+    severity: medium
+    stride: [denial-of-service]
+    cwe: [CWE-770]
+    attack: [T1496, T1499]
+    countermeasures: [set-pod-resource-limits]
+
+  - id: flat-cluster-network
+    name: Any pod can reach any other pod because no NetworkPolicy limits traffic
+    components: [kubernetes]
+    severity: medium
+    stride: [information-disclosure, elevation-of-privilege]
+    cwe: [CWE-284]
+    countermeasures: [default-deny-network-policy]
+
+  - id: service-account-token-exposed
+    name: Every pod gets a Kubernetes API token mounted, so a compromised pod can call the cluster API
+    components: [kubernetes]
+    severity: medium
+    stride: [elevation-of-privilege]
+    cwe: [CWE-522]
+    attack: [T1528]
+    countermeasures: [disable-sa-token-automount]
+
+  # ---- CI/CD pipeline -------------------------------------------------------
+  - id: unpinned-ci-actions
+    name: Workflows use third-party actions by mutable tag, so a hijacked action runs with your secrets
+    components: [ci-pipeline]
     severity: high
-    stride: [information-disclosure, tampering]
-    cwe: [CWE-668]
-    attack: [T1190]
-    countermeasures: [private-network-for-data-stores]
+    stride: [tampering, elevation-of-privilege]
+    cwe: [CWE-829, CWE-494]
+    attack: [T1195.002]
+    countermeasures: [pin-actions-to-sha]
+
+  - id: overbroad-workflow-token
+    name: The workflow token can write to the repo, packages, or releases although the job only reads
+    components: [ci-pipeline]
+    severity: medium
+    stride: [elevation-of-privilege]
+    cwe: [CWE-269]
+    attack: [T1528]
+    countermeasures: [least-privilege-workflow-permissions]
+
+  - id: untrusted-pr-code-in-privileged-workflow
+    name: A pull_request_target or similar workflow runs code from a fork's pull request with secrets and a write token
+    components: [ci-pipeline]
+    severity: high
+    stride: [elevation-of-privilege, tampering]
+    cwe: [CWE-829, CWE-94]
+    attack: [T1195.002, T1059]
+    countermeasures: [no-pr-head-in-privileged-workflows]
 
   # ---- Logging and error handling --------------------------------------------
   - id: verbose-errors

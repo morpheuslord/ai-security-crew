@@ -9,11 +9,15 @@ is never passed in, scanned, or returned.
 from dataclasses import dataclass, field
 
 from mcp_security_review.library import Library, load_library
-from mcp_security_review.library.models import Threat
+from mcp_security_review.library.models import Countermeasure, Threat
 from mcp_security_review.providers.attack import AttackIndex
 
 MAX_FOCUS_AREAS = 12
 MAX_COMPONENT_CHECKS = 15
+# Infrastructure checklists list every countermeasure up to this many: each is a
+# setting the agent can check, and cutting them would drop whole resource types.
+MAX_IAC_CHECKS = 40
+IAC_COMPONENTS = ("container-image", "kubernetes", "ci-pipeline")
 
 
 @dataclass
@@ -54,6 +58,10 @@ class CodeReviewContextBuilder:
 
         Returns:
             SecurityReviewContext with all information needed for AI review.
+            When a picked component is infrastructure code (see
+            `is_iac_component`), the checklist is the infrastructure one: each
+            item carries its scanner check ids, compliance ids, and false
+            positive note, and the app-code baseline is left out.
 
         Raises:
             UnknownComponentError: If a component id is not in the library.
@@ -64,18 +72,24 @@ class CodeReviewContextBuilder:
         picked: list[str] = []
         covered: set[str] = set()
 
+        iac = False
         if components:
             resolution = self._library.resolve(components, data_handled)
             picked = resolution.picked
+            iac = any(is_iac_component(c) for c in picked)
             risk_level = resolution.risk_level.value
             focus_areas.extend(_focus_area(t, attack) for t in resolution.threats)
-            for measure in resolution.countermeasures[:MAX_COMPONENT_CHECKS]:
-                checklist.append(f"{measure.name}: {measure.how_to}")
+            limit = MAX_IAC_CHECKS if iac else MAX_COMPONENT_CHECKS
+            for measure in resolution.countermeasures[:limit]:
+                checklist.append(_iac_item(measure) if iac else _item(measure))
                 covered.add(measure.id)
 
+        # Infrastructure code keeps only the provider-neutral baseline items
+        # (secrets and logging); the rest of the baseline is about app code.
         for measure in self._library.baseline_countermeasures():
-            if measure.id not in covered:
-                checklist.append(f"{measure.name}: {measure.how_to}")
+            if measure.id in covered or (iac and "any" not in measure.providers):
+                continue
+            checklist.append(_item(measure))
 
         focus_areas = _unique(focus_areas)[:MAX_FOCUS_AREAS]
         checklist = _unique(checklist)
@@ -167,6 +181,46 @@ class CodeReviewContextBuilder:
         prompt_parts.append("4. **Recommendations:** Prioritized list of actions")
 
         return "\n".join(prompt_parts)
+
+
+def is_iac_component(component_id: str) -> bool:
+    """Whether a component is infrastructure code (cloud, image, cluster, CI)."""
+    return component_id.startswith("cloud-") or component_id in IAC_COMPONENTS
+
+
+def _item(measure: Countermeasure) -> str:
+    """Plain checklist line."""
+    return f"{measure.name}: {measure.how_to}"
+
+
+def _iac_item(measure: Countermeasure) -> str:
+    """Checklist line with scanner and compliance ids and the false positive note.
+
+    For example `"<name>: <how_to> [Trivy AVD-AWS-0028; Checkov CKV_AWS_79;
+    Prowler ec2_instance_imdsv2_enabled; CIS AWS 6.7] (false positive: ...)"`.
+    """
+    refs: list[tuple[str, list[str]]] = []
+    if measure.checks is not None:
+        refs += [
+            ("Trivy", measure.checks.trivy),
+            ("Checkov", measure.checks.checkov),
+            ("Prowler", measure.checks.prowler),
+            ("KICS", measure.checks.kics),
+        ]
+    if measure.compliance is not None:
+        refs += [
+            ("CIS AWS", measure.compliance.cis_aws),
+            ("CIS Azure", measure.compliance.cis_azure),
+            ("CIS GCP", measure.compliance.cis_gcp),
+            ("NIST 800-53", measure.compliance.nist_800_53),
+        ]
+    text = _item(measure)
+    listed = [f"{label} {', '.join(ids)}" for label, ids in refs if ids]
+    if listed:
+        text += f" [{'; '.join(listed)}]"
+    if measure.false_positives:
+        text += f" (false positive: {measure.false_positives})"
+    return text
 
 
 def _focus_area(threat: Threat, attack: AttackIndex | None) -> str:

@@ -153,7 +153,7 @@ Every failure comes back as `{"success": false, "error": {"code", "message", "hi
 
 ### Threat library
 
-`lightweight_security_review` is backed by a built-in library of **25 components**, **88 threats**, and **85 countermeasures** (web and API apps, plus LLM, agent, and MCP features). Threats carry STRIDE and CWE references (and OWASP MCP Top 10 ids for agent and MCP threats), and countermeasures cite [OWASP ASVS 5.0.0](https://github.com/OWASP/ASVS) requirement ids.
+`lightweight_security_review` is backed by a built-in library of **33 components**, **114 threats**, and **115 countermeasures** (web and API apps, cloud infrastructure as Terraform, container images, Kubernetes, and CI pipelines, plus LLM, agent, and MCP features). Threats carry STRIDE and CWE references (and OWASP MCP Top 10 ids for agent and MCP threats), and countermeasures cite [OWASP ASVS 5.0.0](https://github.com/OWASP/ASVS) requirement ids. Infrastructure countermeasures also name the Trivy, Checkov, Prowler, and KICS checks that test for them, with CIS benchmark and NIST 800-53 ids, so `verify_code_security` returns an infrastructure checklist for them instead of the app-code one.
 
 Add your own components, threats, and countermeasures in `.ai-security-crew/library/*.yaml` in your repo:
 
