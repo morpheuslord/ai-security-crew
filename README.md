@@ -32,6 +32,18 @@ The first three parts are an MCP server plus skills: they give the agent knowled
 
 ## Install
 
+### Requirements
+
+- Python 3.11 or newer
+- [uv](https://docs.astral.sh/uv/), which runs the server and the guard:
+
+  ```bash
+  curl -LsSf https://astral.sh/uv/install.sh | sh                                # macOS and Linux
+  powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"  # Windows
+  ```
+
+- Outbound HTTPS to the public sources the tools read (OSV.dev, CISA KEV, FIRST EPSS, MITRE ATT&CK and CTID on GitHub, deps.dev, OpenSSF Scorecard, and the package and container registries you check). None of them need an API key.
+
 ### Claude Code plugin (recommended)
 
 ```
@@ -99,6 +111,46 @@ docker run --rm -p 8000:8000 mcp-security-review:latest --transport streamable-h
 ```
 
 The server sends its workflow to the connected agent when it starts, so there is nothing else to configure.
+
+### Download the threat catalogues
+
+The exploit and ATT&CK context comes from catalogues the server caches on disk. The plugin fetches them in the background when a Claude Code session starts. With any other setup, fetch them once after installing:
+
+```bash
+uvx --from git+https://github.com/Srajangpt1/ai-security-crew mcp-security-review fetch-intel
+```
+
+It prints one line per source (`kev`, `ctid`, `attack`) and always exits 0. The ATT&CK download is about 55 MB and takes a minute the first time; later runs skip anything still fresh (`--force` refetches). If you skip this step, the tools still work: they fetch on first use and return technique ids without names until the ATT&CK catalogue is ready.
+
+| Variable | Effect |
+|----------|--------|
+| `MCP_SECURITY_REVIEW_CACHE_DIR` | Where the cache lives. Defaults to `$XDG_CACHE_HOME/mcp-security-review`, else `~/.cache/mcp-security-review` |
+| `MCP_SECURITY_REVIEW_NO_PREFETCH=1` | Stops the plugin's session-start download |
+| `READ_ONLY_MODE=true` | Refuses tools that write files (`threatmodel_update_threat_model_file`) |
+| `ENABLED_TOOLS` | Comma-separated tool names to expose; all others are hidden and refused |
+
+### Update
+
+`uvx` caches the version it downloaded. To pick up a new release:
+
+```bash
+uvx --refresh --from git+https://github.com/Srajangpt1/ai-security-crew mcp-security-review --version
+```
+
+Plugin users run `/plugin marketplace update ai-security-crew`.
+
+### From source
+
+```bash
+git clone https://github.com/Srajangpt1/ai-security-crew
+cd ai-security-crew
+uv sync --frozen --dev
+uv run mcp-security-review fetch-intel
+uv run mcp-security-review            # stdio server
+uv run pytest                         # tests
+```
+
+To point an MCP client at the checkout, use `uv` with `--directory /path/to/ai-security-crew run mcp-security-review` as the command.
 
 ## Code security
 
