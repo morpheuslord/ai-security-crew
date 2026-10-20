@@ -60,7 +60,15 @@ class SeverityInfo:
 
 
 def level_for_score(score: float) -> str:
-    """Map a CVSS base score (v3 or v4) to a severity level."""
+    """Map a CVSS base score (v3 or v4) to a severity level.
+
+    Args:
+        score: A CVSS v3 or v4 base score in the 0.0-10.0 range. Both
+            versions use the same severity bands.
+
+    Returns:
+        One of `none`, `low`, `medium`, `high`, `critical`.
+    """
     if score <= 0.0:
         return "none"
     if score < 4.0:
@@ -78,6 +86,14 @@ def score_severity(vuln_data: dict[str, Any]) -> SeverityInfo:
     Prefers a CVSS v4 vector, then CVSS v3, then
     `database_specific.severity`. Returns `level="unknown"` only when no
     usable severity information is present at all.
+
+    Args:
+        vuln_data: A raw OSV vulnerability record (the `dict` returned
+            under `vulns[]` from the OSV API), as passed to
+            `OSVScanner.parse_vuln`.
+
+    Returns:
+        The resolved `SeverityInfo` for this record.
     """
     severity_list = vuln_data.get("severity", [])
     if not isinstance(severity_list, list):
@@ -167,14 +183,21 @@ class Vulnerability:
     def cve_ids(self) -> list[str]:
         """Return CVE identifiers for this vulnerability.
 
-        Includes `id` itself when it matches the CVE shape, plus any CVE
-        aliases, de-duplicated while keeping first-seen order.
+        Includes `id` itself when it matches the strict CVE shape
+        (`^CVE-\\d{4}-\\d{4,}$`), plus any aliases matching the same
+        shape, de-duplicated while keeping first-seen order. A
+        "CVE-"-prefixed alias that does not match the strict shape (for
+        example too few digits) is not a real CVE id and is excluded.
+
+        Returns:
+            CVE identifiers in first-seen order (`id` before `aliases`),
+            with duplicates removed.
         """
         ids: list[str] = []
         if _CVE_ID_RE.match(self.id):
             ids.append(self.id)
         for alias in self.aliases:
-            if alias.startswith("CVE-") and alias not in ids:
+            if _CVE_ID_RE.match(alias) and alias not in ids:
                 ids.append(alias)
         return ids
 

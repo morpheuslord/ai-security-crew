@@ -369,21 +369,31 @@ class TestParseVulnAliases:
         v = OSVScanner().parse_vuln(
             {
                 "id": "GHSA-x",
-                "aliases": ["CVE-2024-1", "PYSEC-1"],
+                "aliases": ["CVE-2024-1234", "PYSEC-1"],
                 "severity": [{"type": "CVSS_V3", "score": V3}],
             }
         )
-        assert v.aliases == ["CVE-2024-1", "PYSEC-1"]
-        assert v.to_dict()["aliases"] == ["CVE-2024-1", "PYSEC-1"]
-        assert v.cve_ids() == ["CVE-2024-1"]
+        assert v.aliases == ["CVE-2024-1234", "PYSEC-1"]
+        assert v.to_dict()["aliases"] == ["CVE-2024-1234", "PYSEC-1"]
+        assert v.cve_ids() == ["CVE-2024-1234"]
         assert v.severity == "critical"
         assert v.cvss_score == 9.8
 
     def test_cve_ids_includes_own_id_when_cve_shaped(self) -> None:
         v = OSVScanner().parse_vuln(
-            {"id": "CVE-2024-1", "aliases": ["GHSA-x", "CVE-2024-1"]}
+            {"id": "CVE-2024-1234", "aliases": ["GHSA-x", "CVE-2024-1234"]}
         )
-        assert v.cve_ids() == ["CVE-2024-1"]
+        assert v.cve_ids() == ["CVE-2024-1234"]
+
+    def test_cve_ids_excludes_malformed_cve_prefixed_alias(self) -> None:
+        """A "CVE-"-prefixed alias that doesn't match the strict CVE shape
+        (fewer than 4 digits after the year) is not a real CVE id and must
+        not be returned by cve_ids().
+        """
+        v = OSVScanner().parse_vuln(
+            {"id": "GHSA-x", "aliases": ["CVE-2024-1", "CVE-2024-1234"]}
+        )
+        assert v.cve_ids() == ["CVE-2024-1234"]
 
     def test_to_dict_omits_cvss_fields_when_unset(self) -> None:
         v = Vulnerability(id="CVE-1", summary="Test", severity="low", aliases=[])
