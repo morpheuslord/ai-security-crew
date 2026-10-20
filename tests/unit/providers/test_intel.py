@@ -14,7 +14,7 @@ import httpx
 import pytest
 
 from mcp_security_review.guard.clip import OMITTED
-from mcp_security_review.providers import intel
+from mcp_security_review.providers import attack, intel
 from mcp_security_review.providers.intel import (
     CTID_RAW,
     CTID_TREE_API,
@@ -27,6 +27,7 @@ from mcp_security_review.providers.intel import (
     check_public_host,
     fetch_bytes,
     fetch_epss,
+    fetch_intel,
     fetch_json,
     load_ctid,
     load_kev,
@@ -986,3 +987,97 @@ async def test_build_exploit_contexts_happy_path(
     assert ctx.priority == "upgrade_now"
     assert ctx.sources == {"ctid": f"ok (snapshot {snapshot})"}
     assert ctx.attack_techniques == [{"id": "T1059.001"}, {"id": "T1190"}]
+
+
+# ---- Prefetch ----
+
+
+async def _ok(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+    return {}
+
+
+@pytest.mark.anyio
+async def test_fetch_intel_reports_each_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cache = IntelCache(tmp_path / "cache")
+    monkeypatch.setattr(intel, "load_kev", _ok)
+    monkeypatch.setattr(intel, "load_ctid", _ok)
+    monkeypatch.setattr(attack, "refresh_attack_index", _ok)
+
+    statuses = await fetch_intel(cache)
+
+    assert statuses == {"kev": "ok", "ctid": "ok", "attack": "ok"}
+
+
+@pytest.mark.anyio
+async def test_fetch_intel_reports_failure_code(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def boom(*_args: Any, **_kwargs: Any) -> Any:
+        raise FetchError("timeout")
+
+    cache = IntelCache(tmp_path / "cache")
+    monkeypatch.setattr(intel, "load_kev", _ok)
+    monkeypatch.setattr(intel, "load_ctid", _ok)
+    monkeypatch.setattr(attack, "refresh_attack_index", boom)
+
+    statuses = await fetch_intel(cache)
+
+    assert statuses == {"kev": "ok", "ctid": "ok", "attack": "failed: timeout"}
+
+
+@pytest.mark.anyio
+async def test_fetch_intel_skips_fresh_cache_without_force(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cache = IntelCache(tmp_path / "cache")
+    cache.put(intel._KEV_CACHE_KEY, KEV_FIXTURE)
+    cache.put(
+        intel._CTID_CACHE_KEY,
+        {"attack_version": "attack-16.1", "snapshot": "kev-01.01.2024", "by_cve": {}},
+    )
+    cache.put(attack.ATTACK_INDEX_KEY, {"version": "20.0", "techniques": {}})
+
+    async def fail_if_called(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("a fresh source must not be refetched")
+
+    monkeypatch.setattr(intel, "load_kev", fail_if_called)
+    monkeypatch.setattr(intel, "load_ctid", fail_if_called)
+    monkeypatch.setattr(attack, "refresh_attack_index", fail_if_called)
+
+    statuses = await fetch_intel(cache)
+
+    assert statuses == {"kev": "fresh", "ctid": "fresh", "attack": "fresh"}
+
+
+@pytest.mark.anyio
+async def test_fetch_intel_force_refetches_fresh_cache(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cache = IntelCache(tmp_path / "cache")
+    cache.put(intel._KEV_CACHE_KEY, KEV_FIXTURE)
+    cache.put(
+        intel._CTID_CACHE_KEY,
+        {"attack_version": "attack-16.1", "snapshot": "kev-01.01.2024", "by_cve": {}},
+    )
+    cache.put(attack.ATTACK_INDEX_KEY, {"version": "20.0", "techniques": {}})
+    monkeypatch.setattr(intel, "load_kev", _ok)
+    monkeypatch.setattr(intel, "load_ctid", _ok)
+    monkeypatch.setattr(attack, "refresh_attack_index", _ok)
+
+    statuses = await fetch_intel(cache, force=True)
+
+    assert statuses == {"kev": "ok", "ctid": "ok", "attack": "ok"}
+
+
+@pytest.mark.anyio
+async def test_fetch_intel_only_requested_sources(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cache = IntelCache(tmp_path / "cache")
+    monkeypatch.setattr(intel, "load_kev", _ok)
+
+    statuses = await fetch_intel(cache, sources=("kev",))
+
+    assert statuses == {"kev": "ok"}

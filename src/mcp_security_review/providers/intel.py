@@ -18,6 +18,7 @@ import os
 import re
 import socket
 import tempfile
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -1116,3 +1117,101 @@ async def build_exploit_contexts(
     finally:
         if owns_client:
             await active_client.aclose()
+
+
+# ---- Prefetch ----
+
+PREFETCH_SOURCES = ("kev", "ctid", "attack")
+
+
+async def _prefetch_one(
+    cache: IntelCache,
+    key: str,
+    ttl: timedelta,
+    force: bool,
+    refresh: Callable[[], Any],
+) -> str:
+    """Run one prefetch source and report its status; never raises.
+
+    Args:
+        cache: Cache the source is keyed in.
+        key: The source's cache key.
+        ttl: The source's freshness window.
+        force: Skip the freshness check and refetch unconditionally.
+        refresh: Zero-argument async callable that performs the refetch.
+
+    Returns:
+        `"fresh"` when the cache already holds a within-TTL entry and
+        `force` is false, `"ok"` when `refresh` completed, or
+        `"failed: <code>"` when it raised.
+    """
+    if not force and cache.get(key, ttl) is not None:
+        return "fresh"
+    try:
+        await refresh()
+    except FetchError as exc:
+        return f"failed: {exc.code}"
+    except Exception:  # defensive: a prefetch source must never raise
+        logger.exception("Prefetch of %s failed", key)
+        return "failed: error"
+    return "ok"
+
+
+async def fetch_intel(
+    cache: IntelCache | None = None,
+    *,
+    sources: tuple[str, ...] = PREFETCH_SOURCES,
+    force: bool = False,
+) -> dict[str, str]:
+    """Refresh the cached threat-intel sources, reporting a status for each.
+
+    Meant for a background prefetch (the `fetch-intel` CLI command, or the
+    SessionStart hook that runs it) so the first real tool call does not
+    pay for a cold cache. Each source is independent: a failure on one
+    does not stop the others, and this never raises.
+
+    Args:
+        cache: Cache to read and write. A default `IntelCache()` when
+            omitted.
+        sources: Which sources to refresh: any of `"kev"`, `"ctid"`,
+            `"attack"`.
+        force: Refetch even when the cache already holds a within-TTL
+            entry.
+
+    Returns:
+        Status per source: `"ok"` (refetched), `"fresh"` (the cache was
+        already within its TTL and `force` was false), or
+        `"failed: <code>"` (the `FetchError` code, or `"error"` for any
+        other exception).
+    """
+    active_cache = cache if cache is not None else IntelCache()
+    statuses: dict[str, str] = {}
+    async with new_client() as client:
+        # Imported lazily: attack.py imports from this module.
+        from mcp_security_review.providers import attack as attack_provider
+
+        specs: dict[str, tuple[str, timedelta, Callable[[], Any]]] = {
+            "kev": (
+                _KEV_CACHE_KEY,
+                _KEV_TTL,
+                lambda: load_kev(client, active_cache, refresh=True),
+            ),
+            "ctid": (
+                _CTID_CACHE_KEY,
+                _CTID_TTL,
+                lambda: load_ctid(client, active_cache, refresh=True),
+            ),
+            "attack": (
+                attack_provider.ATTACK_INDEX_KEY,
+                attack_provider.ATTACK_INDEX_TTL,
+                lambda: attack_provider.refresh_attack_index(client, active_cache),
+            ),
+        }
+        for name in sources:
+            spec = specs.get(name)
+            if spec is None:
+                statuses[name] = "failed: unknown_source"
+                continue
+            key, ttl, refresh = spec
+            statuses[name] = await _prefetch_one(active_cache, key, ttl, force, refresh)
+    return statuses
