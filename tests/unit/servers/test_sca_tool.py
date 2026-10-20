@@ -1,12 +1,15 @@
 """Tests for the sca_scan_dependencies tool."""
 
 import json
+from collections.abc import Awaitable, Callable
 from typing import Any
 from unittest.mock import patch
 
 import pytest
 from fastmcp import Client
 
+from mcp_security_review.guard.clip import OMITTED
+from mcp_security_review.providers.intel import ExploitContext
 from mcp_security_review.providers.sca.osv import (
     OSVScanner,
     ScanResult,
@@ -17,12 +20,32 @@ from mcp_security_review.servers.main import main_mcp
 
 PKGS = json.dumps([{"name": "pyjwt", "version": "2.4.0", "ecosystem": "pypi"}])
 
+BuildContexts = Callable[..., Awaitable[dict[str, ExploitContext]]]
 
-async def scan(results: list[ScanResult], **args: Any) -> dict[str, Any]:
+
+async def _no_enrichment(
+    vulns: list[Vulnerability], **kw: Any
+) -> dict[str, ExploitContext]:
+    """Default stand-in for `build_exploit_contexts`: no contexts, no network."""
+    return {}
+
+
+async def scan(
+    results: list[ScanResult],
+    *,
+    build_contexts: BuildContexts | None = None,
+    **args: Any,
+) -> dict[str, Any]:
     async def fake(self: OSVScanner, packages: list[dict]) -> list[ScanResult]:
         return results
 
-    with patch.object(OSVScanner, "scan_packages", fake):
+    with (
+        patch.object(OSVScanner, "scan_packages", fake),
+        patch(
+            "mcp_security_review.servers.sca.build_exploit_contexts",
+            build_contexts or _no_enrichment,
+        ),
+    ):
         async with Client(main_mcp) as client:
             result = await client.call_tool(
                 "sca_scan_dependencies", {"packages_json": PKGS, **args}
@@ -105,3 +128,62 @@ async def test_scan_failure_has_code_and_hint() -> None:
     error = data["errors"][0]["error"]
     assert error["code"] == "osv_unavailable"
     assert error["hint"]
+
+
+@pytest.mark.anyio
+async def test_scan_lists_upgrade_now_and_exploit_context() -> None:
+    vuln = Vulnerability(id="CVE-2021-44228", summary="s", severity="critical")
+    ctx = ExploitContext(
+        cves=["CVE-2021-44228"],
+        kev=True,
+        kev_ransomware=True,
+        kev_due_date="2021-12-24",
+        epss=0.97,
+        epss_percentile=0.99,
+        priority="upgrade_now",
+        sources={},
+    )
+
+    async def fake_build(
+        vulns: list[Vulnerability], **kw: Any
+    ) -> dict[str, ExploitContext]:
+        return {v.id: ctx for v in vulns}
+
+    data = await scan(
+        [ScanResult("pyjwt", "2.4.0", "pypi", vulnerabilities=[vuln])],
+        build_contexts=fake_build,
+    )
+    assert data["upgrade_now"] == ["CVE-2021-44228"]
+    found = data["results"][0]["vulnerabilities"][0]
+    assert found["exploit_context"]["priority"] == "upgrade_now"
+    assert found["exploit_context"]["kev"] is True
+    assert "upgrade_now" in data["action_required"]
+
+
+@pytest.mark.anyio
+async def test_scan_survives_enrichment_exception() -> None:
+    vuln = Vulnerability(id="CVE-2021-44228", summary="s", severity="critical")
+
+    async def fake_build(
+        vulns: list[Vulnerability], **kw: Any
+    ) -> dict[str, ExploitContext]:
+        raise RuntimeError("boom")
+
+    data = await scan(
+        [ScanResult("pyjwt", "2.4.0", "pypi", vulnerabilities=[vuln])],
+        build_contexts=fake_build,
+    )
+    assert data["status"] == "vulnerabilities_found"
+    found = data["results"][0]["vulnerabilities"][0]
+    assert found["exploit_context"]["sources"]["kev"].startswith("unavailable")
+    assert found["exploit_context"]["sources"]["epss"].startswith("unavailable")
+    assert data["upgrade_now"] == []
+
+
+@pytest.mark.anyio
+async def test_injected_summary_is_clipped() -> None:
+    vuln = Vulnerability(id="GHSA-1", summary="A" * 10_000, severity="low")
+
+    data = await scan([ScanResult("pyjwt", "2.4.0", "pypi", vulnerabilities=[vuln])])
+    summary = data["results"][0]["vulnerabilities"][0]["summary"]
+    assert len(summary) <= 500 + len(OMITTED)

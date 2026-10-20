@@ -16,6 +16,7 @@ import cvss
 import httpx
 
 from mcp_security_review.errors import error_body
+from mcp_security_review.providers.intel import untrusted
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +24,9 @@ OSV_API_URL = "https://api.osv.dev/v1"
 OSV_QUERY_URL = f"{OSV_API_URL}/query"
 
 _CVE_ID_RE = re.compile(r"^CVE-\d{4}-\d{4,}$")
+
+_SUMMARY_LIMIT = 500
+"""OSV summaries are third-party feed text; clip them with `untrusted`."""
 
 # --- CVSS severity scoring -------------------------------------------------
 #
@@ -240,10 +244,17 @@ class Vulnerability:
             check["if_unsure"] = "No fixed version listed; avoid the affected API."
         return check
 
-    def to_dict(self) -> dict:
+    def to_dict(self, exploit_context: dict[str, Any] | None = None) -> dict:
+        """Return this vulnerability as a plain, JSON-serialisable dict.
+
+        Args:
+            exploit_context: The `ExploitContext.to_dict()` output for this
+                vulnerability, when enrichment ran and found one. Added
+                under `"exploit_context"` when given.
+        """
         result: dict = {
             "id": self.id,
-            "summary": self.summary,
+            "summary": untrusted(self.summary, _SUMMARY_LIMIT),
             "severity": self.severity,
         }
         if self.affected_versions:
@@ -258,6 +269,8 @@ class Vulnerability:
         if self.cvss_vector is not None:
             result["cvss_vector"] = self.cvss_vector
         result["reachability_check"] = self.reachability_check()
+        if exploit_context is not None:
+            result["exploit_context"] = exploit_context
         return result
 
 
@@ -276,7 +289,15 @@ class ScanResult:
     def has_vulnerabilities(self) -> bool:
         return len(self.vulnerabilities) > 0
 
-    def to_dict(self) -> dict:
+    def to_dict(
+        self, exploit_contexts: dict[str, dict[str, Any]] | None = None
+    ) -> dict:
+        """Return this scan result as a plain, JSON-serialisable dict.
+
+        Args:
+            exploit_contexts: `ExploitContext.to_dict()` output keyed by
+                vulnerability id, passed through to each vulnerability.
+        """
         result: dict = {
             "name": self.name,
             "version": self.version,
@@ -285,7 +306,10 @@ class ScanResult:
         }
         if self.vulnerabilities:
             result["vulnerability_count"] = len(self.vulnerabilities)
-            result["vulnerabilities"] = [v.to_dict() for v in self.vulnerabilities]
+            contexts = exploit_contexts or {}
+            result["vulnerabilities"] = [
+                v.to_dict(contexts.get(v.id)) for v in self.vulnerabilities
+            ]
         if self.error:
             result["error"] = error_body(
                 self.error_code or "scan_failed",

@@ -18,9 +18,11 @@ import os
 import re
 import socket
 import tempfile
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
+from urllib.parse import urlencode
 
 import anyio
 import httpx
@@ -28,6 +30,19 @@ import httpx
 from mcp_security_review.guard.clip import clip
 
 logger = logging.getLogger(__name__)
+
+
+class _CveBearing(Protocol):
+    """Anything shaped like a `Vulnerability`: an id plus CVE ids.
+
+    Used instead of importing `Vulnerability` at runtime, which would make
+    `providers/sca/osv.py` and this module import each other.
+    """
+
+    id: str
+
+    def cve_ids(self) -> list[str]: ...
+
 
 # ---- HTTP ----
 
@@ -484,3 +499,389 @@ def untrusted(text: object, limit: int) -> str:
         The cleaned, clipped text.
     """
     return clip(_UNSAFE_CHARS.sub("", str(text)), limit)
+
+
+# ---- KEV ----
+
+KEV_URL = (
+    "https://www.cisa.gov/sites/default/files/feeds/"
+    "known_exploited_vulnerabilities.json"
+)
+_KEV_CACHE_KEY = "kev"
+_KEV_TTL = timedelta(hours=24)
+_KEV_MAX_BYTES = 20 * 1024 * 1024
+
+
+@dataclass
+class KevEntry:
+    """One CISA Known Exploited Vulnerabilities catalog entry.
+
+    Attributes:
+        cve: The CVE id this entry is for.
+        ransomware: Whether CISA has recorded ransomware campaign use.
+        due_date: Remediation due date (`YYYY-MM-DD`), if the feed has one.
+        date_added: Date the entry was added to the catalog, if present.
+    """
+
+    cve: str
+    ransomware: bool
+    due_date: str | None
+    date_added: str | None
+
+
+def _parse_kev(data: Any) -> dict[str, KevEntry]:
+    """Turn a raw KEV feed payload into a map keyed by CVE id."""
+    out: dict[str, KevEntry] = {}
+    if not isinstance(data, dict):
+        return out
+    entries = data.get("vulnerabilities", [])
+    if not isinstance(entries, list):
+        return out
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        cve = entry.get("cveID")
+        if not isinstance(cve, str) or not cve:
+            continue
+        due_date = entry.get("dueDate")
+        date_added = entry.get("dateAdded")
+        out[cve] = KevEntry(
+            cve=cve,
+            ransomware=str(entry.get("knownRansomwareCampaignUse", "")).strip().lower()
+            == "known",
+            due_date=due_date if isinstance(due_date, str) else None,
+            date_added=date_added if isinstance(date_added, str) else None,
+        )
+    return out
+
+
+async def load_kev(
+    client: httpx.AsyncClient, cache: IntelCache, *, refresh: bool = False
+) -> dict[str, KevEntry]:
+    """Load the CISA KEV catalog, caching it on disk for 24 hours.
+
+    Args:
+        client: Client from `new_client`.
+        cache: Cache to read from and write to.
+        refresh: Skip the fresh-cache check and fetch unconditionally. A
+            failed fetch still falls back to a stale cached copy.
+
+    Returns:
+        KEV entries keyed by CVE id.
+
+    Raises:
+        FetchError: The fetch failed and no cached copy, stale or fresh,
+            is available.
+    """
+    if not refresh:
+        cached = cache.get(_KEV_CACHE_KEY, _KEV_TTL)
+        if cached is not None:
+            return _parse_kev(cached)
+    try:
+        data = await fetch_json(client, KEV_URL, max_bytes=_KEV_MAX_BYTES)
+    except FetchError:
+        stale = cache.get_stale(_KEV_CACHE_KEY)
+        if stale is not None:
+            stale_data, _fetched_at = stale
+            return _parse_kev(stale_data)
+        raise
+    cache.put(_KEV_CACHE_KEY, data)
+    return _parse_kev(data)
+
+
+# ---- EPSS ----
+
+EPSS_URL = "https://api.first.org/data/v1/epss"
+_EPSS_TTL = timedelta(hours=24)
+_EPSS_MAX_BYTES = 2 * 1024 * 1024
+_EPSS_CHUNK_SIZE = 100
+
+# Module-level, process-wide cache: EPSS is queried per CVE id across many
+# tool calls, and a disk round trip is unnecessary for a 24 hour score.
+_EPSS_CACHE: dict[str, tuple["EpssScore", datetime]] = {}
+
+
+@dataclass
+class EpssScore:
+    """One FIRST.org EPSS score for a CVE.
+
+    Attributes:
+        cve: The CVE id this score is for.
+        epss: Exploit Prediction Scoring System probability, 0.0-1.0.
+        percentile: Percentile of this score among all scored CVEs, 0.0-1.0.
+        date: The score's publication date as reported by the feed.
+    """
+
+    cve: str
+    epss: float
+    percentile: float
+    date: str
+
+
+def _parse_epss_items(data: Any) -> list["EpssScore"]:
+    """Parse the `data` array of an EPSS API response into scores."""
+    items = data.get("data", []) if isinstance(data, dict) else []
+    if not isinstance(items, list):
+        return []
+    scores: list[EpssScore] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        cve = item.get("cve")
+        if not isinstance(cve, str) or not cve:
+            continue
+        try:
+            epss_value = float(item.get("epss"))
+            percentile_value = float(item.get("percentile"))
+        except (TypeError, ValueError):
+            continue
+        date_value = item.get("date")
+        scores.append(
+            EpssScore(
+                cve=cve,
+                epss=epss_value,
+                percentile=percentile_value,
+                date=date_value if isinstance(date_value, str) else "",
+            )
+        )
+    return scores
+
+
+async def fetch_epss(
+    client: httpx.AsyncClient, cve_ids: list[str]
+) -> dict[str, EpssScore]:
+    """Fetch EPSS scores for CVE ids, chunked and cached in-process.
+
+    Args:
+        client: Client from `new_client`.
+        cve_ids: CVE ids to score. Duplicates are fetched once.
+
+    Returns:
+        EPSS scores keyed by CVE id. Ids the feed has no score for are
+        simply absent from the result.
+
+    Raises:
+        FetchError: A chunk request failed. Scores already resolved from
+            the in-memory cache before the failing chunk are lost; callers
+            that want best-effort behaviour across a mix of cached and
+            uncached ids should catch this themselves.
+    """
+    now = datetime.now(UTC)
+    result: dict[str, EpssScore] = {}
+    to_fetch: list[str] = []
+    seen: set[str] = set()
+    for cve in cve_ids:
+        if cve in seen:
+            continue
+        seen.add(cve)
+        cached = _EPSS_CACHE.get(cve)
+        if cached is not None and now - cached[1] < _EPSS_TTL:
+            result[cve] = cached[0]
+        else:
+            to_fetch.append(cve)
+
+    for start in range(0, len(to_fetch), _EPSS_CHUNK_SIZE):
+        chunk = to_fetch[start : start + _EPSS_CHUNK_SIZE]
+        query = urlencode({"cve": ",".join(chunk)})
+        data = await fetch_json(
+            client, f"{EPSS_URL}?{query}", max_bytes=_EPSS_MAX_BYTES
+        )
+        for score in _parse_epss_items(data):
+            result[score.cve] = score
+            _EPSS_CACHE[score.cve] = (score, now)
+
+    return result
+
+
+# ---- Exploit context ----
+
+EPSS_UPGRADE_PERCENTILE = 0.9
+
+
+def priority(*, kev: bool | None, pct: float | None) -> str:
+    """Decide upgrade priority from KEV membership and EPSS percentile.
+
+    Args:
+        kev: Whether the CVE is in the CISA KEV catalog, or `None` if that
+            could not be determined.
+        pct: EPSS percentile (0.0-1.0), or `None` if unavailable.
+
+    Returns:
+        `"upgrade_now"` when `kev` is true or `pct` is at or above
+        `EPSS_UPGRADE_PERCENTILE`; `"check_reachability"` otherwise. Does
+        not return `"unknown"`: that only applies when a vulnerability has
+        no CVE ids at all, which callers decide before reaching this.
+    """
+    if kev or (pct is not None and pct >= EPSS_UPGRADE_PERCENTILE):
+        return "upgrade_now"
+    return "check_reachability"
+
+
+@dataclass
+class ExploitContext:
+    """Exploitation signal for one vulnerability, from public feeds.
+
+    Attributes:
+        cves: CVE ids this context covers (from `Vulnerability.cve_ids()`).
+        kev: Whether any of `cves` is in the CISA KEV catalog, or `None`
+            when KEV could not be checked.
+        kev_ransomware: Whether CISA recorded ransomware campaign use for
+            the KEV entry, or `None` when there is no KEV entry or KEV
+            could not be checked.
+        kev_due_date: The KEV entry's remediation due date, or `None`.
+        epss: The highest EPSS probability across `cves`, or `None` when
+            EPSS could not be checked or had no score for any of them.
+        epss_percentile: The percentile for `epss`, or `None`.
+        attack_techniques: MITRE ATT&CK techniques linked to this
+            vulnerability. Empty for now; a later task fills this in with
+            CTID technique ids (and, after that, ATT&CK names) under
+            `sources["ctid"]`.
+        priority: `"upgrade_now"`, `"check_reachability"`, or `"unknown"`
+            (no CVE ids to look up).
+        sources: Per-source status for sources that failed, e.g.
+            `{"kev": "unavailable: timeout"}`. A source that succeeded is
+            absent from this mapping.
+    """
+
+    cves: list[str]
+    kev: bool | None
+    kev_ransomware: bool | None
+    kev_due_date: str | None
+    epss: float | None
+    epss_percentile: float | None
+    attack_techniques: list[dict[str, str]] = field(default_factory=list)
+    priority: str = "unknown"
+    sources: dict[str, str] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return this context as a plain, JSON-serialisable dict."""
+        return {
+            "cves": self.cves,
+            "kev": self.kev,
+            "kev_ransomware": self.kev_ransomware,
+            "kev_due_date": self.kev_due_date,
+            "epss": self.epss,
+            "epss_percentile": self.epss_percentile,
+            "attack_techniques": self.attack_techniques,
+            "priority": self.priority,
+            "sources": self.sources,
+        }
+
+
+async def build_exploit_contexts(
+    vulns: list[_CveBearing],
+    *,
+    client: httpx.AsyncClient | None = None,
+    cache: IntelCache | None = None,
+) -> dict[str, ExploitContext]:
+    """Build exploit context for each vulnerability, keyed by its id.
+
+    Looks up KEV membership and EPSS scores for every CVE id the given
+    vulnerabilities carry, in two calls shared across all of them, then
+    assembles one `ExploitContext` per vulnerability.
+
+    Never raises: a KEV or EPSS failure is recorded as
+    `sources["kev"]`/`sources["epss"]` (`"unavailable: <code>"`) and the
+    corresponding fields are left `None`, but the function still returns
+    a context for every vulnerability passed in.
+
+    Args:
+        vulns: Vulnerabilities to build context for. Only `.id` and
+            `.cve_ids()` are used, so an OSV `Vulnerability` or anything
+            shaped like one works.
+        client: Client from `new_client`. A new one is created and closed
+            when omitted.
+        cache: Cache for the KEV catalog. A default `IntelCache()` is used
+            when omitted.
+
+    Returns:
+        `ExploitContext` keyed by vulnerability id.
+    """
+    owns_client = client is None
+    active_client = client if client is not None else new_client()
+    active_cache = cache if cache is not None else IntelCache()
+    try:
+        all_cve_ids: list[str] = []
+        seen_cves: set[str] = set()
+        for vuln in vulns:
+            for cve in vuln.cve_ids():
+                if cve not in seen_cves:
+                    seen_cves.add(cve)
+                    all_cve_ids.append(cve)
+
+        kev_map: dict[str, KevEntry] = {}
+        kev_unavailable: str | None = None
+        try:
+            kev_map = await load_kev(active_client, active_cache)
+        except FetchError as exc:
+            kev_unavailable = f"unavailable: {exc.code}"
+        except Exception:  # defensive: this helper must never raise
+            logger.exception("KEV lookup failed")
+            kev_unavailable = "unavailable: error"
+
+        epss_map: dict[str, EpssScore] = {}
+        epss_unavailable: str | None = None
+        if all_cve_ids:
+            try:
+                epss_map = await fetch_epss(active_client, all_cve_ids)
+            except FetchError as exc:
+                epss_unavailable = f"unavailable: {exc.code}"
+            except Exception:  # defensive: this helper must never raise
+                logger.exception("EPSS lookup failed")
+                epss_unavailable = "unavailable: error"
+
+        contexts: dict[str, ExploitContext] = {}
+        for vuln in vulns:
+            cves = vuln.cve_ids()
+            sources: dict[str, str] = {}
+            if kev_unavailable is not None:
+                sources["kev"] = kev_unavailable
+            if epss_unavailable is not None:
+                sources["epss"] = epss_unavailable
+
+            if not cves:
+                contexts[vuln.id] = ExploitContext(
+                    cves=[],
+                    kev=None,
+                    kev_ransomware=None,
+                    kev_due_date=None,
+                    epss=None,
+                    epss_percentile=None,
+                    priority="unknown",
+                    sources=sources,
+                )
+                continue
+
+            kev_entry: KevEntry | None = None
+            if kev_unavailable is None:
+                for cve in cves:
+                    kev_entry = kev_map.get(cve)
+                    if kev_entry is not None:
+                        break
+
+            epss_entry: EpssScore | None = None
+            if epss_unavailable is None:
+                for cve in cves:
+                    candidate = epss_map.get(cve)
+                    if candidate is not None and (
+                        epss_entry is None or candidate.epss > epss_entry.epss
+                    ):
+                        epss_entry = candidate
+
+            kev_flag = None if kev_unavailable is not None else kev_entry is not None
+            pct = epss_entry.percentile if epss_entry is not None else None
+
+            contexts[vuln.id] = ExploitContext(
+                cves=cves,
+                kev=kev_flag,
+                kev_ransomware=kev_entry.ransomware if kev_entry else None,
+                kev_due_date=kev_entry.due_date if kev_entry else None,
+                epss=epss_entry.epss if epss_entry else None,
+                epss_percentile=pct,
+                priority=priority(kev=kev_flag, pct=pct),
+                sources=sources,
+            )
+        return contexts
+    finally:
+        if owns_client:
+            await active_client.aclose()

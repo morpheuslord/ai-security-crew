@@ -12,7 +12,13 @@ from fastmcp import Context, FastMCP
 from pydantic import Field
 
 from mcp_security_review.errors import tool_error
+from mcp_security_review.providers.intel import (
+    ExploitContext,
+    build_exploit_contexts,
+    new_client,
+)
 from mcp_security_review.providers.sca import OSVScanner, PackageRegistry
+from mcp_security_review.providers.sca.osv import Vulnerability
 
 logger = logging.getLogger(__name__)
 
@@ -197,12 +203,64 @@ async def scan_dependencies(
         response["message"] = "No known vulnerabilities found in scanned packages."
         return json.dumps(response, indent=2, ensure_ascii=False)
 
+    all_vulns = [v for r in vulnerable_results for v in r.vulnerabilities]
+    client = new_client()
+    try:
+        exploit_contexts = await build_exploit_contexts(all_vulns, client=client)
+    except Exception:  # enrichment is best effort; the scan must not fail
+        logger.exception("Exploit context enrichment failed")
+        exploit_contexts = _unavailable_contexts(all_vulns)
+    finally:
+        await client.aclose()
+
     response["status"] = "vulnerabilities_found"
-    response["results"] = [r.to_dict() for r in vulnerable_results]
+    response["results"] = [
+        r.to_dict(
+            {
+                v.id: exploit_contexts[v.id].to_dict()
+                for v in r.vulnerabilities
+                if v.id in exploit_contexts
+            }
+        )
+        for r in vulnerable_results
+    ]
+    response["upgrade_now"] = sorted(
+        {
+            v.id
+            for v in all_vulns
+            if (ctx := exploit_contexts.get(v.id)) is not None
+            and ctx.priority == "upgrade_now"
+        }
+    )
     response["action_required"] = (
         "For each vulnerability, answer its reachability_check from your "
         "own code. Upgrade to the fixed version when the affected "
         "symbols are used or you cannot tell; otherwise note it and "
-        "consider upgrading anyway."
+        "consider upgrading anyway. Upgrade every id in upgrade_now "
+        "whatever the reachability answer: it is in CISA KEV or in the "
+        "top 10% of EPSS."
     )
     return json.dumps(response, indent=2, ensure_ascii=False)
+
+
+def _unavailable_contexts(vulns: list[Vulnerability]) -> dict[str, ExploitContext]:
+    """Build an all-sources-unavailable context for each vulnerability.
+
+    Used only when `build_exploit_contexts` itself raises, which it is
+    documented not to do; this is the last-resort fallback so a bug in
+    enrichment never turns a successful scan into a tool failure.
+    """
+    contexts: dict[str, ExploitContext] = {}
+    for vuln in vulns:
+        cves = vuln.cve_ids()
+        contexts[vuln.id] = ExploitContext(
+            cves=cves,
+            kev=None,
+            kev_ransomware=None,
+            kev_due_date=None,
+            epss=None,
+            epss_percentile=None,
+            priority="unknown" if not cves else "check_reachability",
+            sources={"kev": "unavailable: error", "epss": "unavailable: error"},
+        )
+    return contexts

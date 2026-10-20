@@ -17,15 +17,21 @@ from mcp_security_review.guard.clip import OMITTED
 from mcp_security_review.providers import intel
 from mcp_security_review.providers.intel import (
     HOSTNAME_RE,
+    ExploitContext,
     FetchError,
     IntelCache,
     UnsafeHostError,
+    build_exploit_contexts,
     check_public_host,
     fetch_bytes,
+    fetch_epss,
     fetch_json,
+    load_kev,
     new_client,
+    priority,
     untrusted,
 )
+from mcp_security_review.providers.sca.osv import Vulnerability
 
 MB = 1024 * 1024
 
@@ -614,3 +620,202 @@ def test_untrusted_injection_shaped_megabyte() -> None:
 def test_untrusted_keeps_ordinary_unicode() -> None:
     text = "caf\u00e9 \u4e2d\u6587 \u05e9\u05dc\u05d5\u05dd \U0001f600"
     assert untrusted(text, 100) == text
+
+
+# ---- KEV ----
+
+KEV_FIXTURE = {
+    "vulnerabilities": [
+        {
+            "cveID": "CVE-2021-44228",
+            "vendorProject": "Apache",
+            "product": "Log4j2",
+            "dateAdded": "2021-12-10",
+            "dueDate": "2021-12-24",
+            "knownRansomwareCampaignUse": "Known",
+        },
+        {
+            "cveID": "CVE-2020-0001",
+            "vendorProject": "Example",
+            "product": "Thing",
+            "dateAdded": "2020-01-01",
+            "dueDate": "2020-01-15",
+            "knownRansomwareCampaignUse": "Unknown",
+        },
+    ]
+}
+
+
+@pytest.mark.anyio
+async def test_kev_lookup_from_fixture(tmp_path: Path) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=KEV_FIXTURE)
+
+    cache = IntelCache(tmp_path / "cache")
+    async with _client(handler) as c:
+        kev = await load_kev(c, cache)
+    entry = kev["CVE-2021-44228"]
+    assert entry.ransomware is True
+    assert entry.due_date == "2021-12-24"
+    assert kev["CVE-2020-0001"].ransomware is False
+
+
+@pytest.mark.anyio
+async def test_kev_stale_cache_used_on_failure(tmp_path: Path) -> None:
+    cache = IntelCache(tmp_path / "cache")
+    cache.put("kev", KEV_FIXTURE)
+
+    async with _client(lambda r: httpx.Response(503)) as c:
+        kev = await load_kev(c, cache, refresh=True)
+    assert kev["CVE-2021-44228"].ransomware is True
+
+
+@pytest.mark.anyio
+async def test_kev_fetch_failure_without_cache_raises(tmp_path: Path) -> None:
+    cache = IntelCache(tmp_path / "cache")
+    async with _client(lambda r: httpx.Response(503)) as c:
+        with pytest.raises(FetchError):
+            await load_kev(c, cache)
+
+
+# ---- EPSS ----
+
+
+@pytest.mark.anyio
+async def test_epss_chunks_of_100(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(intel, "_EPSS_CACHE", {})
+    ids = [f"CVE-2024-{i:05d}" for i in range(250)]
+    chunk_sizes: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        cves = request.url.params.get("cve", "")
+        chunk = cves.split(",") if cves else []
+        chunk_sizes.append(len(chunk))
+        data = [
+            {"cve": cve, "epss": "0.5", "percentile": "0.5", "date": "2024-01-01"}
+            for cve in chunk
+        ]
+        return httpx.Response(200, json={"status": "OK", "data": data})
+
+    async with _client(handler) as c:
+        result = await fetch_epss(c, ids)
+    assert chunk_sizes == [100, 100, 50]
+    assert len(result) == 250
+    assert result["CVE-2024-00000"].epss == 0.5
+
+
+@pytest.mark.anyio
+async def test_epss_uses_in_memory_cache(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(intel, "_EPSS_CACHE", {})
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(
+            200,
+            json={
+                "status": "OK",
+                "data": [
+                    {
+                        "cve": "CVE-2024-99999",
+                        "epss": "0.3",
+                        "percentile": "0.4",
+                        "date": "2024-01-01",
+                    }
+                ],
+            },
+        )
+
+    async with _client(handler) as c:
+        first = await fetch_epss(c, ["CVE-2024-99999"])
+        second = await fetch_epss(c, ["CVE-2024-99999"])
+    assert first["CVE-2024-99999"].epss == 0.3
+    assert second["CVE-2024-99999"].epss == 0.3
+    assert calls == 1
+
+
+# ---- Exploit context ----
+
+
+def test_priority_rules() -> None:
+    assert priority(kev=True, pct=0.1) == "upgrade_now"
+    assert priority(kev=False, pct=0.9) == "upgrade_now"
+    assert priority(kev=False, pct=0.89) == "check_reachability"
+    assert priority(kev=None, pct=None) == "check_reachability"
+
+
+@pytest.mark.anyio
+async def test_sources_marked_unavailable_when_kev_down(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(intel, "_EPSS_CACHE", {})
+    vuln = Vulnerability(id="CVE-2021-44228", summary="s", severity="critical")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if "known_exploited_vulnerabilities" in str(request.url):
+            return httpx.Response(503)
+        return httpx.Response(200, json={"status": "OK", "data": []})
+
+    cache = IntelCache(tmp_path / "cache")
+    async with _client(handler) as c:
+        contexts = await build_exploit_contexts([vuln], client=c, cache=cache)
+    ctx = contexts["CVE-2021-44228"]
+    assert isinstance(ctx, ExploitContext)
+    assert ctx.kev is None
+    assert ctx.sources["kev"].startswith("unavailable")
+
+
+@pytest.mark.anyio
+async def test_no_cves_gives_unknown_priority(tmp_path: Path) -> None:
+    vuln = Vulnerability(id="GHSA-xxxx-yyyy-zzzz", summary="s", severity="low")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"vulnerabilities": []})
+
+    cache = IntelCache(tmp_path / "cache")
+    async with _client(handler) as c:
+        contexts = await build_exploit_contexts([vuln], client=c, cache=cache)
+    ctx = contexts["GHSA-xxxx-yyyy-zzzz"]
+    assert ctx.priority == "unknown"
+    assert ctx.cves == []
+    assert ctx.sources == {}
+
+
+@pytest.mark.anyio
+async def test_build_exploit_contexts_happy_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(intel, "_EPSS_CACHE", {})
+    vuln = Vulnerability(id="CVE-2021-44228", summary="s", severity="critical")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if "known_exploited_vulnerabilities" in str(request.url):
+            return httpx.Response(200, json=KEV_FIXTURE)
+        return httpx.Response(
+            200,
+            json={
+                "status": "OK",
+                "data": [
+                    {
+                        "cve": "CVE-2021-44228",
+                        "epss": "0.97",
+                        "percentile": "0.99",
+                        "date": "2024-01-01",
+                    }
+                ],
+            },
+        )
+
+    cache = IntelCache(tmp_path / "cache")
+    async with _client(handler) as c:
+        contexts = await build_exploit_contexts([vuln], client=c, cache=cache)
+    ctx = contexts["CVE-2021-44228"]
+    assert ctx.kev is True
+    assert ctx.kev_ransomware is True
+    assert ctx.kev_due_date == "2021-12-24"
+    assert ctx.epss == 0.97
+    assert ctx.epss_percentile == 0.99
+    assert ctx.priority == "upgrade_now"
+    assert ctx.sources == {}
+    assert ctx.attack_techniques == []
