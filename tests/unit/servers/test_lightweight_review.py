@@ -70,7 +70,7 @@ async def test_implied_threats_are_secondary_and_capped() -> None:
     assert "csrf" not in {t["id"] for t in assessment["threats"]}
     assert "csrf" in {t["id"] for t in assessment["also_consider"]}
     assert len(assessment["also_consider"]) <= 8
-    assert data["metadata"]["also_consider_total"] >= len(assessment["also_consider"])
+    assert assessment["also_consider_total"] >= len(assessment["also_consider"])
 
 
 @pytest.mark.anyio
@@ -106,6 +106,14 @@ async def test_picking_many_components_adds_a_narrowing_hint() -> None:
 
     assert narrow["hint"] is None
     assert "7 components" in broad["hint"]
+
+
+@pytest.mark.anyio
+async def test_alias_counts_as_one_pick_for_the_narrowing_hint() -> None:
+    data = await call(task_description="x", components="container-and-iac")
+
+    assert len(data["assessment"]["components"]) > 6
+    assert data["hint"] is None
 
 
 @pytest.mark.anyio

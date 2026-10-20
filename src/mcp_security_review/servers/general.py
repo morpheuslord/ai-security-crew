@@ -160,11 +160,13 @@ async def lightweight_security_review(
         return unknown_component_error(e, {"task_description": task_description})
 
     view = describe(result, MAX_ALSO_CONSIDER, attack=load_attack_index())
+    # Count the ids the caller passed: an alias such as container-and-iac is
+    # one deliberate pick even though it expands to several components.
     broad_hint = (
-        f"You picked {len(result.picked)} components. Most changes involve 2 to 5; "
+        f"You picked {len(picked)} components. Most changes involve 2 to 5; "
         "pick only what this change adds or modifies for a shorter, more relevant "
         "result."
-        if len(result.picked) > MAX_TYPICAL_COMPONENTS
+        if len(picked) > MAX_TYPICAL_COMPONENTS
         else None
     )
     response = {
@@ -195,7 +197,6 @@ async def lightweight_security_review(
         "metadata": {
             "total_threats": len(result.threats),
             "total_countermeasures": len(result.countermeasures),
-            "also_consider_total": len(result.also_consider),
             "review_purpose": "lightweight_security_guidance",
         },
     }

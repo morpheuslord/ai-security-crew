@@ -8,6 +8,7 @@ from typing import Any
 import pytest
 from fastmcp import Client
 
+from mcp_security_review.library import builtin_library, describe
 from mcp_security_review.providers.attack import PENDING_STATUS, AttackIndex
 from mcp_security_review.servers import library_support
 from mcp_security_review.servers.main import main_mcp
@@ -338,3 +339,111 @@ async def test_attack_tool_answers_from_a_stale_index_and_refreshes(
 async def test_attack_tool_is_read_only() -> None:
     tools = await main_mcp.get_tools()
     assert "write" not in tools[ATTACK].tags
+
+
+UPDATE = "threatmodel_update_threat_model_file"
+
+
+def _model(*statuses: str) -> str:
+    return json.dumps(
+        {
+            "title": "Upload service",
+            "threats": [
+                {"id": f"TM-{i}", "what_can_go_wrong": "x", "status": status}
+                for i, status in enumerate(statuses, start=1)
+            ],
+        }
+    )
+
+
+@pytest.mark.anyio
+async def test_update_reports_created_then_overwritten_then_appended(
+    tmp_path: Path,
+) -> None:
+    target = str(tmp_path / "threat-model.md")
+
+    created = await call(UPDATE, threat_model_json=_model("open"), file_path=target)
+    overwritten = await call(UPDATE, threat_model_json=_model("open"), file_path=target)
+    appended = await call(
+        UPDATE, threat_model_json=_model("open"), file_path=target, append=True
+    )
+
+    assert created["action"] == "created"
+    assert overwritten["action"] == "overwritten"
+    assert appended["action"] == "appended"
+
+
+@pytest.mark.anyio
+async def test_append_to_a_missing_file_reports_created(tmp_path: Path) -> None:
+    target = str(tmp_path / "threat-model.md")
+
+    data = await call(
+        UPDATE, threat_model_json=_model("open"), file_path=target, append=True
+    )
+
+    assert data["action"] == "created"
+
+
+@pytest.mark.anyio
+async def test_status_counts_sum(tmp_path: Path) -> None:
+    data = await call(
+        UPDATE,
+        threat_model_json=_model("open", "in_progress", "mitigated", "accepted"),
+        file_path=str(tmp_path / "threat-model.md"),
+    )
+
+    stats = data["stats"]
+    assert stats["threats_documented"] == 4
+    assert (stats["open"], stats["in_progress"]) == (1, 1)
+    assert (stats["mitigated"], stats["accepted"]) == (1, 1)
+    statuses = ("open", "in_progress", "mitigated", "accepted")
+    assert sum(stats[s] for s in statuses) == stats["threats_documented"]
+
+
+@pytest.mark.anyio
+async def test_unknown_status_counts_as_open(tmp_path: Path) -> None:
+    data = await call(
+        UPDATE,
+        threat_model_json=_model("wontfix", "mitigated"),
+        file_path=str(tmp_path / "threat-model.md"),
+    )
+
+    assert data["stats"]["open"] == 1
+    assert data["stats"]["mitigated"] == 1
+
+
+@pytest.mark.anyio
+async def test_update_tool_is_a_write_tool() -> None:
+    tools = await main_mcp.get_tools()
+    assert "write" in tools[UPDATE].tags
+
+
+def test_also_consider_total_matches_or_flags_truncation() -> None:
+    library = builtin_library()
+    upload = library.resolve(["file-upload"])
+    database = library.resolve(["database"])
+
+    long_view = describe(upload, 8)
+    short_view = describe(database, 8)
+
+    assert len(upload.also_consider) > 8
+    assert len(long_view["also_consider"]) == 8
+    assert long_view["also_consider_total"] == len(upload.also_consider)
+    assert long_view["also_consider_truncated"] is True
+    assert short_view["also_consider_total"] == len(short_view["also_consider"])
+    assert short_view["also_consider_truncated"] is False
+
+
+@pytest.mark.anyio
+async def test_review_reports_also_consider_total_once() -> None:
+    async with Client(main_mcp) as client:
+        result = await client.call_tool(
+            "general_lightweight_security_review",
+            {"task_description": "Upload", "components": "file-upload"},
+        )
+    items = result if isinstance(result, list) else result.content
+    data = json.loads(items[0].text)
+
+    assert data["assessment"]["also_consider_truncated"] is True
+    assert data["assessment"]["also_consider_total"] > 8
+    assert "also_consider_total" not in data["metadata"]

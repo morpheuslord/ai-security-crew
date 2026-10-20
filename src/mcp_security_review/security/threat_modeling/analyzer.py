@@ -8,7 +8,7 @@ structure, context enrichment, and reference integration.
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from mcp_security_review.library import Library, describe, load_library
@@ -163,7 +163,7 @@ class ThreatModelAnalyzer:
             author=response_data.get("author", "security-review-mcp"),
             created_at=response_data.get(
                 "created_at",
-                datetime.now(tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                datetime.now(tz=UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
             ),
             data_touched=response_data.get("data_touched", []),
             technologies=response_data.get("technologies", []),

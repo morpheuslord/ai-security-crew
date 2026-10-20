@@ -781,6 +781,7 @@ cli = [
 name = "mcp-security-review"
 source = { editable = "." }
 dependencies = [
+    { name = "anyio" },
     { name = "click" },
     { name = "cvss" },
     { name = "fastmcp" },
@@ -817,6 +818,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "anyio", specifier = ">=4" },
     { name = "click", specifier = ">=8.1.7" },
     { name = "cvss", specifier = ">=3.6" },
     { name = "fastmcp", specifier = ">=2.3.4,<2.4.0" },

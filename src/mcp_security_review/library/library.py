@@ -202,8 +202,11 @@ def describe(
             carries the technique name and tactics, without one only the id.
 
     Returns:
-        The view. `sources["attack"]` says whether technique names were
-        available (`"ok (ATT&CK <version>)"`) or are still pending.
+        The view. `also_consider` lists at most `max_also_consider` threats;
+        `also_consider_total` is the full count and `also_consider_truncated`
+        says whether the list was cut. `sources["attack"]` says whether
+        technique names were available (`"ok (ATT&CK <version>)"`) or are still
+        pending.
     """
     _, attack_status = attack_summary([], attack)
     return {
@@ -229,6 +232,8 @@ def describe(
             {"id": t.id, "name": t.name, "severity": t.severity.value}
             for t in resolution.also_consider[:max_also_consider]
         ],
+        "also_consider_total": len(resolution.also_consider),
+        "also_consider_truncated": len(resolution.also_consider) > max_also_consider,
         "sources": {"attack": attack_status},
     }
 
