@@ -292,11 +292,25 @@ def _client(handler: Handler) -> tuple[httpx.AsyncClient, list[httpx.Request]]:
     return httpx.AsyncClient(transport=httpx.MockTransport(record)), calls
 
 
-def _github(status: int = 200, body: bytes = REFS_BODY) -> Handler:
+def _github(
+    status: int = 200,
+    body: bytes = REFS_BODY,
+    *,
+    owner_status: int = 200,
+    owner_exc: Exception | None = None,
+) -> Handler:
+    """github.com: the refs endpoint, plus the owner page for 401/404 checks."""
+
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.url.host == "github.com"
-        assert request.url.params["service"] == "git-upload-pack"
-        return httpx.Response(status, content=body if status == 200 else b"")
+        if request.url.path.endswith("/info/refs"):
+            assert request.url.params["service"] == "git-upload-pack"
+            return httpx.Response(status, content=body if status == 200 else b"")
+        assert request.method == "HEAD"
+        assert request.url.path.count("/") == 1
+        if owner_exc is not None:
+            raise owner_exc
+        return httpx.Response(owner_status)
 
     return handler
 
@@ -450,12 +464,58 @@ async def test_action_unknown_sha_is_unverified_not_invalid(
 @pytest.mark.anyio
 @pytest.mark.parametrize("status", [404, 401])
 async def test_action_missing_repo(github_dns: list[str], status: int) -> None:
-    client, _ = _client(_github(status))
+    # GitHub answers 401 for private and missing repos alike; only a missing
+    # owner proves the action does not exist.
+    client, calls = _client(_github(status, owner_status=404))
     async with client:
-        result = await verify_action(client, "actions/chekout", "v4")
+        result = await verify_action(client, "no-such-owner-x/chekout", "v4")
     assert result.exists is False
     assert not result.is_valid()
     assert result.to_dict()["issue"] == "package_not_found"
+    assert [(r.method, r.url.path) for r in calls] == [
+        ("GET", "/no-such-owner-x/chekout.git/info/refs"),
+        ("HEAD", "/no-such-owner-x"),
+    ]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("status", [404, 401])
+@pytest.mark.parametrize("owner_status", [200, 429, 500])
+async def test_action_private_repo_cannot_verify(
+    github_dns: list[str], status: int, owner_status: int
+) -> None:
+    client, _ = _client(_github(status, owner_status=owner_status))
+    async with client:
+        result = await verify_action(client, "actions/private-thing", "v4")
+    assert result.status == "cannot_verify_anonymously"
+    assert result.exists is None
+    assert result.is_valid()
+    data = result.to_dict()
+    assert "issue" not in data
+    assert data["note"]
+
+
+@pytest.mark.anyio
+async def test_action_owner_check_failing_cannot_verify(
+    github_dns: list[str],
+) -> None:
+    handler = _github(401, owner_exc=httpx.ReadTimeout("slow"))
+    client, _ = _client(handler)
+    async with client:
+        result = await verify_action(client, "actions/private-thing", "v4")
+    assert result.status == "cannot_verify_anonymously"
+    assert result.is_valid()
+
+
+@pytest.mark.anyio
+async def test_action_github_unresolvable(monkeypatch: pytest.MonkeyPatch) -> None:
+    _patch_dns(monkeypatch, {})
+    client, calls = _client(_github())
+    async with client:
+        result = await verify_action(client, "actions/checkout", "v4")
+    assert result.status == "registry_unresolvable"
+    assert result.is_valid()
+    assert calls == []
 
 
 @pytest.mark.anyio
@@ -500,8 +560,32 @@ async def test_action_bad_name_no_request(
         result = await verify_action(client, name, ref)
     assert not result.is_valid()
     assert result.status == "invalid_name"
+    data = result.to_dict()
+    assert data["issue"] == "invalid_name"
+    assert "local" in data["note"] and "docker://" in data["note"]
     assert calls == []
     assert github_dns == []
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("verify", [verify_action, verify_image])
+@pytest.mark.parametrize(("name", "ref"), [(5, "v1"), ("actions/checkout", 1)])
+async def test_non_string_name_or_ref_is_invalid_name(
+    github_dns: list[str], verify: Callable[..., Any], name: object, ref: object
+) -> None:
+    client, calls = _client(_github())
+    async with client:
+        result = await verify(client, name, ref)
+    assert result.status == "invalid_name"
+    assert result.to_dict()["issue"] == "invalid_name"
+    assert json.dumps(result.to_dict())
+    assert calls == []
+
+
+@pytest.mark.anyio
+async def test_registry_non_string_ecosystem_unsupported() -> None:
+    result = await PackageRegistry().verify_package("x", "1", 5)  # type: ignore[arg-type]
+    assert result.error_code == "unsupported_ecosystem"
 
 
 @pytest.mark.parametrize(
@@ -688,8 +772,32 @@ async def test_image_bad_name_or_ref_no_request(
         result = await verify_image(client, name, ref)
     assert result.status == "invalid_name"
     assert not result.is_valid()
+    assert result.to_dict()["issue"] == "invalid_name"
     assert calls == []
     assert hub_dns == []
+
+
+@pytest.mark.anyio
+async def test_image_registry_unresolvable(hub_dns: list[str]) -> None:
+    client, calls = _client(_registry())
+    async with client:
+        result = await verify_image(client, "nxdomain.example.com/app", "1.0")
+    assert result.status == "registry_unresolvable"
+    assert result.exists is None
+    assert result.is_valid()
+    data = result.to_dict()
+    assert "issue" not in data
+    assert "resolve" in data["note"]
+    assert calls == []
+
+
+@pytest.mark.anyio
+async def test_token_realm_unresolvable(hub_dns: list[str]) -> None:
+    client, calls = _client(_registry(realm="https://nxdomain.example.com/token"))
+    async with client:
+        result = await verify_image(client, "python", "3.12-slim")
+    assert result.status == "registry_unresolvable"
+    assert [(r.method, r.url.host) for r in calls] == [("HEAD", HUB)]
 
 
 @pytest.mark.anyio

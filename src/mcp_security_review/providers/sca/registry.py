@@ -18,6 +18,7 @@ from thefuzz import fuzz, process
 from mcp_security_review.errors import error_body
 from mcp_security_review.providers.intel import (
     FetchError,
+    UnresolvableHostError,
     UnsafeHostError,
     check_public_host,
     fetch_bytes,
@@ -52,8 +53,10 @@ _STATUS_NOTES = {
     "invalid_name": (
         "Not a valid name or version for this ecosystem, so nothing was "
         "looked up. GitHub Actions: name 'owner/repo[/path]', version a tag, "
-        "branch, or 40-character commit SHA. Containers: name "
-        "'[registry/]repository', version a tag or sha256 digest."
+        "branch, or 40-character commit SHA; local actions ('./path') and "
+        "'docker://' references are not registry packages and cannot be "
+        "verified here. Containers: name '[registry/]repository' with no tag, "
+        "version a tag or sha256 digest."
     ),
     "unverified_sha": (
         "This commit is not the tip of any branch or tag, so it could not be "
@@ -61,12 +64,18 @@ _STATUS_NOTES = {
         "commit of this repository and not of a fork."
     ),
     "cannot_verify_anonymously": (
-        "The registry needs credentials (or uses a non-standard port), so "
-        "the image could not be checked. It is not confirmed missing."
+        "The repository or registry needs credentials (it may be private, or "
+        "use a non-standard port), so it could not be checked anonymously. "
+        "It is not confirmed missing."
     ),
     "unsafe_host": (
         "The registry or its token service is not a public host, so it was "
         "not contacted. It is not confirmed missing; verify it yourself."
+    ),
+    "registry_unresolvable": (
+        "The registry or its token service host name did not resolve in DNS, "
+        "so it was not contacted. Check the host name for typos; it is not "
+        "confirmed missing."
     ),
 }
 
@@ -242,7 +251,9 @@ class PackageVerification:
                 ),
             )
         elif not self.is_valid():
-            if self.exists is False:
+            if self.status == "invalid_name":
+                result["issue"] = "invalid_name"
+            elif self.exists is False:
                 result["issue"] = "package_not_found"
             elif self.version_exists is False:
                 result["issue"] = "version_not_found"
@@ -267,7 +278,7 @@ class PackageRegistry:
         self, name: str, version: str, ecosystem: str
     ) -> PackageVerification:
         """Verify a single package exists with the given version."""
-        ecosystem = ecosystem.lower().strip()
+        ecosystem = str(ecosystem).lower().strip()
         if ecosystem in _PYPI_ALIASES:
             return await self._verify_pypi(name, version)
         elif ecosystem in _NPM_ALIASES:
@@ -301,7 +312,8 @@ class PackageRegistry:
                 version = pkg.get("version", "")
                 ecosystem = pkg.get("ecosystem", "pypi")
                 use = client
-                if ecosystem.lower().strip() in _ACTIONS_ALIASES | _CONTAINER_ALIASES:
+                eco = str(ecosystem).lower().strip()
+                if eco in _ACTIONS_ALIASES | _CONTAINER_ALIASES:
                     if intel_client is None:
                         intel_client = await stack.enter_async_context(new_client())
                     use = intel_client
@@ -316,7 +328,7 @@ class PackageRegistry:
         version: str,
         ecosystem: str,
     ) -> PackageVerification:
-        ecosystem = ecosystem.lower().strip()
+        ecosystem = str(ecosystem).lower().strip()
         if ecosystem in _PYPI_ALIASES:
             return await self._verify_pypi_with_client(client, name, version)
         elif ecosystem in _NPM_ALIASES:
@@ -545,6 +557,7 @@ _DOCKER_HUB_ALIASES = frozenset(
 _REFS_MAX_BYTES = 5 * 1024 * 1024
 _MANIFEST_MAX_BYTES = 4 * 1024 * 1024  # the OCI spec's manifest size limit
 _TOKEN_MAX_BYTES = 64 * 1024
+_OWNER_PAGE_MAX_BYTES = 1024 * 1024
 _MAX_IMAGE_NAME = 255
 _MANIFEST_ACCEPT = ", ".join(
     (
@@ -570,16 +583,43 @@ def _inconclusive(
     )
 
 
-def _invalid_name(name: str, ref: str, ecosystem: str) -> PackageVerification:
+def _invalid_name(name: object, ref: object, ecosystem: str) -> PackageVerification:
     """A result for a name or ref that is malformed, so never looked up."""
     return PackageVerification(
-        name=name,
-        version=ref,
+        name=str(name),
+        version=str(ref),
         ecosystem=ecosystem,
         exists=False,
         version_exists=False,
         status="invalid_name",
     )
+
+
+def _host_status(exc: FetchError) -> str:
+    """Status for an `unsafe_host` refusal: unresolvable, or non-public."""
+    if isinstance(exc.__cause__, UnresolvableHostError):
+        return "registry_unresolvable"
+    return "unsafe_host"
+
+
+async def _github_owner_missing(client: httpx.AsyncClient, owner: str) -> bool:
+    """Say whether github.com definitely has no user or org named `owner`.
+
+    Smart HTTP answers 401 for a private repository and for a missing one
+    alike, so only a 404 on the owner's page proves the action is missing.
+    Any other answer, or any failure, is not proof.
+    """
+    try:
+        await fetch_bytes(
+            client,
+            f"{GITHUB_URL}/{owner}",
+            max_bytes=_OWNER_PAGE_MAX_BYTES,
+            method="HEAD",
+            guard_host=True,
+        )
+    except FetchError as exc:
+        return exc.code == "http_404"
+    return False
 
 
 def _unavailable(
@@ -653,7 +693,7 @@ def _action_parts(name: str) -> tuple[str, str, str] | None:
 
 
 async def verify_action(
-    client: httpx.AsyncClient, name: str, ref: str
+    client: httpx.AsyncClient, name: object, ref: object
 ) -> PackageVerification:
     """Check a GitHub Action ref against the repository's advertised refs.
 
@@ -663,12 +703,18 @@ async def verify_action(
         ref: The part after `@`: a tag, branch, or 40-character commit SHA.
 
     Returns:
-        A missing repository (404 or 401) gives `exists=False`; a missing
-        tag or branch gives `version_exists=False`. A SHA is `pinned`; one
+        A 404 or 401 from the repository gives `exists=False` only when the
+        owner is missing too; otherwise the repository may be private, so
+        the status is `cannot_verify_anonymously`. A missing tag or branch
+        gives `version_exists=False`. A malformed name or ref (including
+        local `./path` and `docker://` references) gives status
+        `invalid_name` and no request. A SHA is `pinned`; one
         that is not a branch or tag tip has status `unverified_sha` and is
         not treated as missing. A tag or branch is valid but `pinned=False`,
         with `suggested_fix` pinning it to its commit SHA.
     """
+    if not isinstance(name, str) or not isinstance(ref, str):
+        return _invalid_name(name, ref, ACTIONS_ECOSYSTEM)
     parts = _action_parts(name)
     if parts is None or not _REF.fullmatch(ref):
         return _invalid_name(name, ref, ACTIONS_ECOSYSTEM)
@@ -680,16 +726,20 @@ async def verify_action(
         )
     except FetchError as exc:
         if exc.code in ("http_404", "http_401"):
+            if not await _github_owner_missing(client, owner):
+                return _inconclusive(
+                    name, ref, ACTIONS_ECOSYSTEM, "cannot_verify_anonymously"
+                )
             return PackageVerification(
                 name=name,
                 version=ref,
                 ecosystem=ACTIONS_ECOSYSTEM,
                 exists=False,
                 version_exists=False,
-                suggestion=f"No public GitHub repository '{owner}/{repo}'.",
+                suggestion=f"No GitHub user or organization '{owner}'.",
             )
         if exc.code == "unsafe_host":
-            return _inconclusive(name, ref, ACTIONS_ECOSYSTEM, "unsafe_host")
+            return _inconclusive(name, ref, ACTIONS_ECOSYSTEM, _host_status(exc))
         logger.warning("GitHub refs lookup failed for %s: %s", name, exc.code)
         return _unavailable(name, ref, ACTIONS_ECOSYSTEM, exc)
 
@@ -806,7 +856,7 @@ async def _anonymous_token(
 
 
 async def verify_image(
-    client: httpx.AsyncClient, name: str, ref: str
+    client: httpx.AsyncClient, name: object, ref: object
 ) -> PackageVerification:
     """Check a container image tag or digest against its registry.
 
@@ -822,8 +872,12 @@ async def verify_image(
         manifest (404) gives `version_exists=False`. A registry that needs
         credentials or a non-standard port gives status
         `cannot_verify_anonymously`; a registry or token realm on a
-        non-public host gives status `unsafe_host` and is never contacted.
+        non-public host gives status `unsafe_host` (or
+        `registry_unresolvable` when its name does not resolve) and is
+        never contacted.
     """
+    if not isinstance(name, str) or not isinstance(ref, str):
+        return _invalid_name(name, ref, CONTAINER_ECOSYSTEM)
     parsed = parse_image(name)
     if parsed is None or not (_DIGEST.fullmatch(ref) or _TAG.fullmatch(ref)):
         return _invalid_name(name, ref, CONTAINER_ECOSYSTEM)
@@ -835,6 +889,8 @@ async def verify_image(
         )
     try:
         await check_public_host(registry)
+    except UnresolvableHostError:
+        return _inconclusive(name, ref, CONTAINER_ECOSYSTEM, "registry_unresolvable")
     except UnsafeHostError:
         return _inconclusive(name, ref, CONTAINER_ECOSYSTEM, "unsafe_host")
 
@@ -883,7 +939,7 @@ async def verify_image(
                 name, ref, CONTAINER_ECOSYSTEM, "cannot_verify_anonymously"
             )
         if exc.code == "unsafe_host":
-            return _inconclusive(name, ref, CONTAINER_ECOSYSTEM, "unsafe_host")
+            return _inconclusive(name, ref, CONTAINER_ECOSYSTEM, _host_status(exc))
         logger.warning("Registry lookup failed for %s: %s", name, exc.code)
         return _unavailable(name, ref, CONTAINER_ECOSYSTEM, exc)
 

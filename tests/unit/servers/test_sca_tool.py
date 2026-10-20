@@ -472,12 +472,22 @@ async def test_tool_lists_unverified_without_failing() -> None:
                 status="unsafe_host",
             ),
             _pv(version="e" * 40, version_exists=None, status="unverified_sha"),
+            _pv(exists=None, version_exists=None, status="cannot_verify_anonymously"),
+            _pv(
+                name="nxdomain.example.com/app",
+                ecosystem="container",
+                exists=None,
+                version_exists=None,
+                status="registry_unresolvable",
+            ),
         ]
     )
     assert data["all_valid"] is True
     assert [u["status"] for u in data["unverified"]] == [
         "unsafe_host",
         "unverified_sha",
+        "cannot_verify_anonymously",
+        "registry_unresolvable",
     ]
     assert "unpinned" not in data
 
@@ -510,17 +520,31 @@ async def test_scan_accepts_github_actions_ecosystem() -> None:
         ]
     )
 
-    async def sequential_scan(
-        self: OSVScanner, packages: list[dict]
-    ) -> list[ScanResult]:
-        # scan_packages fans out with asyncio.gather; run _scan_one in turn
-        # so this test also runs on trio.
-        return [await self._scan_one(None, pkg) for pkg in packages]  # type: ignore[arg-type]
-
-    with (
-        patch.object(OSVScanner, "_query_osv", fake_query),
-        patch.object(OSVScanner, "scan_packages", sequential_scan),
-    ):
+    with patch.object(OSVScanner, "_query_osv", fake_query):
         data = await call_tool("sca_scan_dependencies", packages_json=packages)
     assert data["status"] == "clean"
     assert seen == ["GitHub Actions"] * 3
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("tool", ["sca_scan_dependencies", "sca_verify_packages"])
+@pytest.mark.parametrize(
+    "package",
+    [
+        {"name": 5, "version": 1, "ecosystem": "container"},
+        {"name": "python", "version": 3.12, "ecosystem": "container"},
+        {"name": "python", "version": "3.12", "ecosystem": 5},
+        {"name": ["x"], "version": "1"},
+    ],
+)
+async def test_non_string_fields_rejected(tool: str, package: dict) -> None:
+    async def no_lookup(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("a lookup ran for a rejected package")
+
+    with (
+        patch.object(OSVScanner, "scan_packages", no_lookup),
+        patch.object(PackageRegistry, "verify_packages", no_lookup),
+    ):
+        data = await call_tool(tool, packages_json=json.dumps([package]))
+    assert data["success"] is False
+    assert data["error"]["code"] == "invalid_packages"

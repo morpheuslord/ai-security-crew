@@ -34,7 +34,12 @@ _VULN_ID_RE = re.compile(
 )
 _MAX_LOOKUP_IDS = 20
 _UNVERIFIED_STATUSES = frozenset(
-    {"unverified_sha", "cannot_verify_anonymously", "unsafe_host"}
+    {
+        "unverified_sha",
+        "cannot_verify_anonymously",
+        "unsafe_host",
+        "registry_unresolvable",
+    }
 )
 
 
@@ -61,11 +66,18 @@ def _parse_packages(packages_json: str) -> list[dict] | str:
             f"Pass a JSON array, for example {_PACKAGES_EXAMPLE}",
         )
     if not isinstance(packages, list) or not all(
-        isinstance(p, dict) and p.get("name") and p.get("version") for p in packages
+        isinstance(p, dict)
+        and isinstance(p.get("name"), str)
+        and isinstance(p.get("version"), str)
+        and p["name"]
+        and p["version"]
+        and isinstance(p.get("ecosystem", "pypi"), str)
+        for p in packages
     ):
         return tool_error(
             "invalid_packages",
-            "packages_json must be a JSON array of objects with name and version.",
+            "packages_json must be a JSON array of objects with string "
+            "name and version (and, if given, a string ecosystem).",
             f"Pass a JSON array, for example {_PACKAGES_EXAMPLE}",
         )
     return packages
@@ -118,7 +130,7 @@ async def verify_packages(
 
     Returns:
         JSON with 'all_valid' (false only when something is definitely
-        missing or could not be checked) and 'packages_checked', plus
+        missing or a check errored) and 'packages_checked', plus
         when relevant: 'invalid_packages' with suggested fixes, 'errors',
         'unpinned' (valid but movable refs, each with 'suggested_fix'),
         'unverified' (inconclusive checks, each with 'status' and

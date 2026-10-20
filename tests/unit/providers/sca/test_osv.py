@@ -1,7 +1,9 @@
 """Tests for the OSV vulnerability scanner and reachability checks."""
 
+from typing import Any
 from unittest.mock import AsyncMock, patch
 
+import anyio
 import httpx
 import pytest
 
@@ -512,3 +514,20 @@ class TestOSVScannerLookup:
         assert vuln is not None
         assert given_client.is_closed is False
         await given_client.aclose()
+
+
+@pytest.mark.anyio
+async def test_scan_packages_concurrent_keeps_order_on_any_backend() -> None:
+    # Runs on asyncio and trio: scan_packages must not be asyncio-only.
+    delays = {"a": 0.03, "b": 0.0, "c": 0.01}
+
+    async def fake_query(
+        self: OSVScanner, client: Any, name: str, version: str, ecosystem: str
+    ) -> list[Vulnerability]:
+        await anyio.sleep(delays[name])
+        return []
+
+    packages = [{"name": n, "version": "1", "ecosystem": "pypi"} for n in "abc"]
+    with patch.object(OSVScanner, "_query_osv", fake_query):
+        results = await OSVScanner().scan_packages(packages)
+    assert [r.name for r in results] == ["a", "b", "c"]

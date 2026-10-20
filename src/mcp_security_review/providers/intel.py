@@ -298,6 +298,10 @@ class UnsafeHostError(ValueError):
     """A host is not a public DNS name, or resolves to a non-public address."""
 
 
+class UnresolvableHostError(UnsafeHostError):
+    """A well-formed public-looking name that has no DNS addresses."""
+
+
 def _blocked(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
     """Say whether an address must never be contacted."""
     if isinstance(ip, ipaddress.IPv6Address):
@@ -325,9 +329,11 @@ async def check_public_host(host: str) -> None:
 
     Raises:
         UnsafeHostError: The name is malformed, is an IP literal, has a
-            private-network suffix, does not resolve, or any address it
-            resolves to is private, loopback, link-local, multicast,
-            reserved, unspecified, or in 100.64.0.0/10.
+            private-network suffix, or any address it resolves to is
+            private, loopback, link-local, multicast, reserved,
+            unspecified, or in 100.64.0.0/10.
+        UnresolvableHostError: The name does not resolve (a subclass of
+            `UnsafeHostError`, so callers that only refuse still refuse).
     """
     if not host.isascii():
         msg = f"not a valid public hostname: {host[:100]!r}"
@@ -350,10 +356,10 @@ async def check_public_host(host: str) -> None:
         infos = await anyio.getaddrinfo(name, 443, type=socket.SOCK_STREAM)
     except OSError as exc:
         msg = f"cannot resolve {host!r}"
-        raise UnsafeHostError(msg) from exc
+        raise UnresolvableHostError(msg) from exc
     if not infos:
         msg = f"no addresses for {host!r}"
-        raise UnsafeHostError(msg)
+        raise UnresolvableHostError(msg)
     for info in infos:
         addr = str(info[4][0]).split("%", 1)[0]
         try:

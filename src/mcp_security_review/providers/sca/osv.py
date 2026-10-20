@@ -6,13 +6,13 @@ calling agent answers by reading its own code; the server does not
 decide reachability.
 """
 
-import asyncio
 import logging
 import re
 from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import quote
 
+import anyio
 import cvss
 import httpx
 
@@ -384,9 +384,18 @@ class OSVScanner:
         Fires one /v1/query POST per package concurrently — each
         returns full vulnerability data so no hydration step needed.
         """
-        async with httpx.AsyncClient(timeout=self._timeout) as client:
-            tasks = [self._scan_one(client, pkg) for pkg in packages]
-            return list(await asyncio.gather(*tasks))
+        results: list[ScanResult | None] = [None] * len(packages)
+
+        async def scan_into(index: int, pkg: dict) -> None:
+            results[index] = await self._scan_one(client, pkg)
+
+        async with (
+            httpx.AsyncClient(timeout=self._timeout) as client,
+            anyio.create_task_group() as tg,
+        ):
+            for index, pkg in enumerate(packages):
+                tg.start_soon(scan_into, index, pkg)
+        return [r for r in results if r is not None]
 
     async def _scan_one(
         self,
