@@ -6,11 +6,15 @@ These tests verify that:
 3. Error handling is preserved
 """
 
+import tomllib
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from mcp_security_review import main
+
+PYPROJECT = tomllib.loads(Path("pyproject.toml").read_text())
 
 
 class TestMainTransportSelection:
@@ -129,3 +133,23 @@ class TestMainTransportSelection:
                             assert (
                                 mock_exit.call_args_list[1][0][0] == 0
                             )  # Finally exit
+
+
+def test_python_floor_is_311() -> None:
+    """Project must require Python 3.11 at minimum, matching ruff's target."""
+    assert PYPROJECT["project"]["requires-python"] == ">=3.11"
+    assert PYPROJECT["tool"]["ruff"]["target-version"] == "py311"
+
+
+def test_runtime_deps_present() -> None:
+    """New intel-provider runtime dependencies must be declared."""
+    deps = " ".join(PYPROJECT["project"]["dependencies"])
+    for name in ("mitreattack-python", "cvss", "pillow>=12.3.0", "requests>=2.33.0"):
+        assert name in deps
+
+
+def test_live_marker_registered_and_deselected() -> None:
+    """The 'live' pytest marker must be registered and off by default."""
+    ini = PYPROJECT["tool"]["pytest"]["ini_options"]
+    assert any(m.startswith("live:") for m in ini["markers"])
+    assert "-m 'not live'" in ini["addopts"] or '-m "not live"' in ini["addopts"]
