@@ -11,7 +11,6 @@ Responses are cached as plain JSON files, and any text taken from a feed is
 passed through `untrusted` before it is returned to an agent.
 """
 
-import asyncio
 import ipaddress
 import json
 import logging
@@ -23,6 +22,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+import anyio
 import httpx
 
 from mcp_security_review.guard.clip import clip
@@ -68,7 +68,12 @@ def new_client(timeout: float = 15.0) -> httpx.AsyncClient:
         verify=True,
         follow_redirects=False,
         timeout=httpx.Timeout(timeout, connect=5.0),
-        headers={"User-Agent": f"mcp-security-review/{__version__}"},
+        headers={
+            "User-Agent": f"mcp-security-review/{__version__}",
+            # No compression: a small gzip body can inflate far past max_bytes
+            # before the cap sees it, so ask for the raw size up front.
+            "Accept-Encoding": "identity",
+        },
     )
 
 
@@ -82,8 +87,13 @@ async def _check_url(url: httpx.URL, *, guard_host: bool) -> None:
         raise FetchError("unsafe_host", "credentials in URL are not allowed")
     if url.port not in (None, 443):
         raise FetchError("unsafe_host", f"port {url.port} is not allowed")
+    await _guard_host(url.host)
+
+
+async def _guard_host(host: str) -> None:
+    """Run `check_public_host`, reporting a refusal as `unsafe_host`."""
     try:
-        await check_public_host(url.host)
+        await check_public_host(host)
     except UnsafeHostError as exc:
         raise FetchError("unsafe_host", str(exc)) from exc
 
@@ -126,6 +136,9 @@ async def _fetch(
                 if hop == MAX_REDIRECTS:
                     raise FetchError("too_many_redirects", f"more than {MAX_REDIRECTS}")
                 target = current.join(location)
+                if target.host != current.host and not guard_host:
+                    # Even fixed feeds must not bounce us onto an internal host.
+                    await _guard_host(target.host)
                 if (target.host, target.port) != (current.host, current.port):
                     # Never hand credentials to an origin the caller did not name.
                     send_headers = {
@@ -176,7 +189,8 @@ async def fetch_bytes(
         method: HTTP method.
         guard_host: Check every hop with `check_public_host` and refuse
             credentials in the URL or a port other than 443. Use it whenever
-            the host comes from user or upstream input.
+            the host comes from user or upstream input. Without it, a
+            redirect to a different host is still checked.
 
     Returns:
         A fully read response whose `content` is the decoded body.
@@ -185,7 +199,7 @@ async def fetch_bytes(
         FetchError: On any failure; see the class for codes.
     """
     try:
-        async with asyncio.timeout(MAX_FETCH_SECONDS):
+        with anyio.fail_after(MAX_FETCH_SECONDS):
             return await _fetch(
                 client,
                 url,
@@ -228,7 +242,9 @@ async def fetch_json(
     resp = await fetch_bytes(client, url, max_bytes=max_bytes, **kw)
     try:
         return json.loads(resp.content)
-    except ValueError as exc:  # JSONDecodeError and UnicodeDecodeError
+    # ValueError covers JSONDecodeError and UnicodeDecodeError; deeply nested
+    # input makes the parser raise RecursionError instead.
+    except (ValueError, RecursionError) as exc:
         raise FetchError("invalid_json", "response is not valid JSON") from exc
 
 
@@ -301,9 +317,8 @@ async def check_public_host(host: str) -> None:
     if name.endswith(_PRIVATE_SUFFIXES):
         msg = f"private-network name: {host!r}"
         raise UnsafeHostError(msg)
-    loop = asyncio.get_running_loop()
     try:
-        infos = await loop.getaddrinfo(name, 443, type=socket.SOCK_STREAM)
+        infos = await anyio.getaddrinfo(name, 443, type=socket.SOCK_STREAM)
     except OSError as exc:
         msg = f"cannot resolve {host!r}"
         raise UnsafeHostError(msg) from exc
@@ -367,7 +382,7 @@ class IntelCache:
         path = self._path(key)
         try:
             entry = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
+        except (OSError, ValueError, RecursionError):
             return None
         if not isinstance(entry, dict) or "data" not in entry:
             return None
@@ -446,14 +461,20 @@ class IntelCache:
 
 # ---- Untrusted text ----
 
-_UNSAFE_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f‪-‮⁦-⁩]")
+_UNSAFE_CHARS = re.compile(
+    r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f"  # C0 (minus tab, LF, CR), DEL, C1
+    r"\u061c\u200b-\u200f\ufeff"  # ALM, zero-width, LRM/RLM, BOM
+    r"\u202a-\u202e\u2066-\u2069"  # bidi embeddings, overrides, isolates
+    r"\U000e0000-\U000e007f]"  # Unicode tag characters
+)
 
 
 def untrusted(text: object, limit: int) -> str:
     """Make third-party text safe to hand back as data.
 
-    Removes control characters (keeping tab, newline, and carriage return)
-    and bidirectional overrides, then clips to `limit` characters.
+    Removes C0 and C1 control characters (keeping tab, newline, and carriage
+    return), bidirectional controls, zero-width and byte-order marks, and
+    Unicode tag characters, then clips to `limit` characters.
 
     Args:
         text: Any value; it is converted with `str`.
