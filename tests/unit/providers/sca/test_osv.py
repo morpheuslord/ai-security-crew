@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock, patch
 import httpx
 import pytest
 
+from mcp_security_review.providers.intel import FetchError
 from mcp_security_review.providers.sca.osv import (
     OSVScanner,
     ScanResult,
@@ -401,3 +402,92 @@ class TestParseVulnAliases:
         assert "cvss_score" not in result
         assert "cvss_vector" not in result
         assert result["aliases"] == []
+
+
+def _mock_client(handler) -> httpx.AsyncClient:
+    return httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+
+class TestOSVScannerLookup:
+    @pytest.mark.asyncio
+    async def test_lookup_found_parses_record(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            assert request.url.path == "/v1/vulns/GHSA-test-1234"
+            return httpx.Response(
+                200, json={"id": "GHSA-test-1234", "summary": "s", "aliases": []}
+            )
+
+        with patch(
+            "mcp_security_review.providers.sca.osv.new_client",
+            lambda timeout=15.0: _mock_client(handler),
+        ):
+            vuln = await OSVScanner().lookup("GHSA-test-1234")
+
+        assert vuln is not None
+        assert vuln.id == "GHSA-test-1234"
+
+    @pytest.mark.asyncio
+    async def test_lookup_not_found_returns_none(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(404)
+
+        with patch(
+            "mcp_security_review.providers.sca.osv.new_client",
+            lambda timeout=15.0: _mock_client(handler),
+        ):
+            vuln = await OSVScanner().lookup("CVE-2024-99999")
+
+        assert vuln is None
+
+    @pytest.mark.asyncio
+    async def test_lookup_other_failure_raises(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(500)
+
+        with patch(
+            "mcp_security_review.providers.sca.osv.new_client",
+            lambda timeout=15.0: _mock_client(handler),
+        ):
+            with pytest.raises(FetchError):
+                await OSVScanner().lookup("GHSA-test-1234")
+
+    @pytest.mark.asyncio
+    async def test_lookup_url_encodes_id(self) -> None:
+        """Defense in depth: the URL is built with `quote` regardless of
+        whether the caller already validated the id's shape.
+        """
+        seen: dict[str, str] = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen["path"] = request.url.raw_path.decode()
+            return httpx.Response(200, json={"id": "x"})
+
+        with patch(
+            "mcp_security_review.providers.sca.osv.new_client",
+            lambda timeout=15.0: _mock_client(handler),
+        ):
+            await OSVScanner().lookup("../../v1/query")
+
+        assert seen["path"] == "/v1/vulns/..%2F..%2Fv1%2Fquery"
+
+    @pytest.mark.asyncio
+    async def test_lookup_populates_affected_packages_deduped_and_capped(
+        self,
+    ) -> None:
+        affected = [
+            {"package": {"name": "pyjwt", "ecosystem": "PyPI"}} for _ in range(25)
+        ]
+        affected[1] = {"package": {"name": "other", "ecosystem": "PyPI"}}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json={"id": "GHSA-x", "affected": affected})
+
+        with patch(
+            "mcp_security_review.providers.sca.osv.new_client",
+            lambda timeout=15.0: _mock_client(handler),
+        ):
+            vuln = await OSVScanner().lookup("GHSA-x")
+
+        assert vuln is not None
+        assert len(vuln.affected_packages) <= 20
+        assert {"ecosystem": "PyPI", "name": "pyjwt"} in vuln.affected_packages

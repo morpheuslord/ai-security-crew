@@ -187,3 +187,130 @@ async def test_injected_summary_is_clipped() -> None:
     data = await scan([ScanResult("pyjwt", "2.4.0", "pypi", vulnerabilities=[vuln])])
     summary = data["results"][0]["vulnerabilities"][0]["summary"]
     assert len(summary) <= 500 + len(OMITTED)
+
+
+async def lookup(
+    lookups: dict[str, Vulnerability | None | Exception],
+    *,
+    build_contexts: BuildContexts | None = None,
+    **args: Any,
+) -> dict[str, Any]:
+    async def fake(self: OSVScanner, vuln_id: str) -> Vulnerability | None:
+        outcome = lookups[vuln_id]
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    with (
+        patch.object(OSVScanner, "lookup", fake),
+        patch(
+            "mcp_security_review.servers.sca.build_exploit_contexts",
+            build_contexts or _no_enrichment,
+        ),
+    ):
+        async with Client(main_mcp) as client:
+            result = await client.call_tool("sca_lookup_vulnerability", args)
+    items = result if isinstance(result, list) else result.content
+    return json.loads(items[0].text)
+
+
+@pytest.mark.anyio
+async def test_lookup_found_with_exploit_context() -> None:
+    vuln = Vulnerability(
+        id="CVE-2021-44228",
+        summary="s",
+        severity="critical",
+        affected_packages=[{"ecosystem": "Maven", "name": "log4j-core"}],
+    )
+    ctx = ExploitContext(
+        cves=["CVE-2021-44228"],
+        kev=True,
+        kev_ransomware=True,
+        kev_due_date="2021-12-24",
+        epss=0.97,
+        epss_percentile=0.99,
+        priority="upgrade_now",
+        sources={},
+    )
+
+    async def fake_build(
+        vulns: list[Vulnerability], **kw: Any
+    ) -> dict[str, ExploitContext]:
+        return {v.id: ctx for v in vulns}
+
+    data = await lookup(
+        {"CVE-2021-44228": vuln},
+        build_contexts=fake_build,
+        vulnerability_ids="CVE-2021-44228",
+    )
+    assert data["success"] is True
+    result = data["results"][0]
+    assert result["id"] == "CVE-2021-44228"
+    assert result["status"] == "found"
+    assert "reachability_check" not in result
+    assert result["affected_packages"] == [{"ecosystem": "Maven", "name": "log4j-core"}]
+    assert result["exploit_context"]["priority"] == "upgrade_now"
+    assert data["upgrade_now"] == ["CVE-2021-44228"]
+
+
+@pytest.mark.anyio
+async def test_lookup_not_found_is_not_failure() -> None:
+    data = await lookup({"CVE-2099-0001": None}, vulnerability_ids="CVE-2099-0001")
+    assert data["success"] is True
+    assert data["results"] == [{"id": "CVE-2099-0001", "status": "not_found"}]
+
+
+@pytest.mark.anyio
+async def test_lookup_mixed_valid_invalid() -> None:
+    data = await lookup(
+        {
+            "CVE-2021-44228": Vulnerability(
+                id="CVE-2021-44228", summary="s", severity="low"
+            )
+        },
+        vulnerability_ids="CVE-2021-44228, not-an-id!!",
+    )
+    assert data["success"] is True
+    statuses = {r["id"]: r["status"] for r in data["results"]}
+    assert statuses["CVE-2021-44228"] == "found"
+    assert statuses["not-an-id!!"] == "invalid_id"
+
+
+@pytest.mark.anyio
+async def test_lookup_cap_20() -> None:
+    ids = ", ".join(f"CVE-2024-{1000 + i}" for i in range(21))
+    data = await lookup({}, vulnerability_ids=ids)
+    assert data["success"] is False
+    assert data["error"]["code"] == "too_many_ids"
+
+
+@pytest.mark.anyio
+async def test_lookup_osv_down_marks_lookup_failed() -> None:
+    data = await lookup(
+        {"CVE-2021-44228": RuntimeError("osv down")},
+        vulnerability_ids="CVE-2021-44228",
+    )
+    assert data["success"] is True
+    assert data["results"] == [{"id": "CVE-2021-44228", "status": "lookup_failed"}]
+
+
+@pytest.mark.anyio
+async def test_lookup_path_injection_id_rejected() -> None:
+    called = False
+
+    async def fake(self: OSVScanner, vuln_id: str) -> Vulnerability | None:
+        nonlocal called
+        called = True
+        return None
+
+    with patch.object(OSVScanner, "lookup", fake):
+        async with Client(main_mcp) as client:
+            result = await client.call_tool(
+                "sca_lookup_vulnerability",
+                {"vulnerability_ids": "../../v1/query"},
+            )
+    items = result if isinstance(result, list) else result.content
+    data = json.loads(items[0].text)
+
+    assert called is False
+    assert data["results"] == [{"id": "../../v1/query", "status": "invalid_id"}]

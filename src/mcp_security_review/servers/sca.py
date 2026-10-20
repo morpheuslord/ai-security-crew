@@ -6,7 +6,8 @@ security verification during coding workflows.
 
 import json
 import logging
-from typing import Annotated
+import re
+from typing import Annotated, Any
 
 from fastmcp import Context, FastMCP
 from pydantic import Field
@@ -23,6 +24,25 @@ from mcp_security_review.providers.sca.osv import Vulnerability
 logger = logging.getLogger(__name__)
 
 _PACKAGES_EXAMPLE = '[{"name": "requests", "version": "2.31.0", "ecosystem": "pypi"}]'
+
+_VULN_ID_RE = re.compile(
+    r"^(CVE-\d{4}-\d{4,}"
+    r"|GHSA(-[23456789cfghjmpqrvwx]{4}){3}"
+    r"|[A-Z][A-Z0-9]*-[A-Za-z0-9._:-]{1,64})$"
+)
+_MAX_LOOKUP_IDS = 20
+
+
+def _split_vulnerability_ids(raw: str) -> list[str]:
+    """Split on commas/whitespace, drop empties, de-duplicate in order."""
+    seen: set[str] = set()
+    ids: list[str] = []
+    for part in re.split(r"[,\s]+", raw.strip()):
+        if not part or part in seen:
+            continue
+        seen.add(part)
+        ids.append(part)
+    return ids
 
 
 def _parse_packages(packages_json: str) -> list[dict] | str:
@@ -240,6 +260,109 @@ async def scan_dependencies(
         "whatever the reachability answer: it is in CISA KEV or in the "
         "top 10% of EPSS."
     )
+    return json.dumps(response, indent=2, ensure_ascii=False)
+
+
+@sca_mcp.tool(tags={"security", "sca", "vulnerability"})
+async def lookup_vulnerability(
+    ctx: Context,
+    vulnerability_ids: Annotated[
+        str,
+        Field(
+            description=(
+                "One or more vulnerability ids to look up directly, "
+                "separated by commas or whitespace (CVE-YYYY-NNNN, "
+                "GHSA-xxxx-xxxx-xxxx, or another OSV id). Up to 20 ids "
+                "per call. Example: "
+                '"CVE-2021-44228, GHSA-jfh8-c2jp-5v3q"'
+            )
+        ),
+    ],
+) -> str:
+    """Look up known vulnerabilities by id, without scanning a package.
+
+    Use this when a vulnerability id is already known (from a report, an
+    advisory link, or a previous scan) and a package-level scan is not
+    needed. Each id is checked against OSV.dev independently; a failure
+    on one id does not stop the others.
+
+    Args:
+        ctx: The FastMCP context.
+        vulnerability_ids: Ids to look up, comma- or whitespace-separated.
+
+    Returns:
+        JSON with `results`: one entry per requested id, in request
+        order, each `{"id", "status"}` where `status` is `found`,
+        `not_found`, `invalid_id`, or `lookup_failed`. A `found` entry
+        also carries the vulnerability's details (minus the
+        reachability_check, which needs a package context this tool
+        does not have), its `affected_packages`, and `exploit_context`.
+        `upgrade_now` lists ids CISA KEV or top-EPSS flags.
+    """
+    ids = _split_vulnerability_ids(vulnerability_ids)
+    if len(ids) > _MAX_LOOKUP_IDS:
+        return tool_error(
+            "too_many_ids",
+            f"Got {len(ids)} ids; at most {_MAX_LOOKUP_IDS} are allowed per call.",
+            "Split the ids across multiple calls.",
+        )
+
+    scanner = OSVScanner()
+    statuses: dict[str, str] = {}
+    vulns: dict[str, Vulnerability] = {}
+    for vuln_id in ids:
+        if not _VULN_ID_RE.match(vuln_id):
+            statuses[vuln_id] = "invalid_id"
+            continue
+        try:
+            vuln = await scanner.lookup(vuln_id)
+        except Exception:  # a bad id or upstream hiccup must not fail the batch
+            logger.exception("OSV lookup failed for %s", vuln_id)
+            statuses[vuln_id] = "lookup_failed"
+            continue
+        if vuln is None:
+            statuses[vuln_id] = "not_found"
+            continue
+        statuses[vuln_id] = "found"
+        vulns[vuln_id] = vuln
+
+    client = new_client()
+    try:
+        exploit_contexts = await build_exploit_contexts(
+            list(vulns.values()), client=client
+        )
+    except Exception:  # enrichment is best effort; the lookup must not fail
+        logger.exception("Exploit context enrichment failed")
+        exploit_contexts = _unavailable_contexts(list(vulns.values()))
+    finally:
+        await client.aclose()
+
+    results: list[dict[str, Any]] = []
+    for vuln_id in ids:
+        status = statuses[vuln_id]
+        if status != "found":
+            results.append({"id": vuln_id, "status": status})
+            continue
+        vuln = vulns[vuln_id]
+        context = exploit_contexts.get(vuln.id)
+        entry = vuln.to_dict(context.to_dict() if context else None)
+        entry.pop("reachability_check", None)
+        entry["status"] = "found"
+        entry["affected_packages"] = vuln.affected_packages
+        results.append(entry)
+
+    response: dict[str, Any] = {
+        "success": True,
+        "results": results,
+        "upgrade_now": sorted(
+            {
+                vuln.id
+                for vuln in vulns.values()
+                if (context := exploit_contexts.get(vuln.id)) is not None
+                and context.priority == "upgrade_now"
+            }
+        ),
+    }
     return json.dumps(response, indent=2, ensure_ascii=False)
 
 

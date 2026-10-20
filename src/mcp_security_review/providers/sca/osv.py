@@ -11,17 +11,26 @@ import logging
 import re
 from dataclasses import dataclass, field
 from typing import Any
+from urllib.parse import quote
 
 import cvss
 import httpx
 
 from mcp_security_review.errors import error_body
-from mcp_security_review.providers.intel import untrusted
+from mcp_security_review.providers.intel import (
+    FetchError,
+    fetch_json,
+    new_client,
+    untrusted,
+)
 
 logger = logging.getLogger(__name__)
 
 OSV_API_URL = "https://api.osv.dev/v1"
 OSV_QUERY_URL = f"{OSV_API_URL}/query"
+
+_LOOKUP_MAX_BYTES = 2 * 1024 * 1024
+_MAX_AFFECTED_PACKAGES = 20
 
 _CVE_ID_RE = re.compile(r"^CVE-\d{4}-\d{4,}$")
 
@@ -183,6 +192,14 @@ class Vulnerability:
     aliases: list[str] = field(default_factory=list)
     cvss_score: float | None = None
     cvss_vector: str | None = None
+    affected_packages: list[dict[str, str]] = field(default_factory=list)
+    """Ecosystem/name pairs OSV lists as affected, capped at 20.
+
+    Populated by `OSVScanner.parse_vuln`, but deliberately left out of
+    `to_dict`: `sca_scan_dependencies` already ties each vulnerability to
+    the single package it scanned, so only `sca_lookup_vulnerability`
+    (which has no package context) adds this field to its response.
+    """
 
     def cve_ids(self) -> list[str]:
         """Return CVE identifiers for this vulnerability.
@@ -437,7 +454,39 @@ class OSVScanner:
             aliases=aliases,
             cvss_score=severity_info.score,
             cvss_vector=severity_info.vector,
+            affected_packages=self._extract_affected_packages(vuln_data),
         )
+
+    async def lookup(self, vuln_id: str) -> Vulnerability | None:
+        """Look up a single vulnerability by id via `GET /v1/vulns/{id}`.
+
+        The id is URL-encoded before it is placed in the path, regardless
+        of whether the caller already validated its shape, so it can
+        never be used to steer the request at a different path.
+
+        Args:
+            vuln_id: The OSV, CVE, or GHSA id to look up.
+
+        Returns:
+            The parsed `Vulnerability`, or `None` when OSV has no record
+            for this id (HTTP 404).
+
+        Raises:
+            FetchError: On any other fetch failure: timeout, connection
+                error, a non-404 HTTP error, or a response over the size
+                cap.
+        """
+        url = f"{OSV_API_URL}/vulns/{quote(vuln_id, safe='')}"
+        client = new_client(timeout=self._timeout)
+        try:
+            data = await fetch_json(client, url, max_bytes=_LOOKUP_MAX_BYTES)
+        except FetchError as exc:
+            if exc.code == "http_404":
+                return None
+            raise
+        finally:
+            await client.aclose()
+        return self.parse_vuln(data)
 
     def _extract_severity(self, vuln_data: dict) -> str:
         """Extract severity from OSV vulnerability data."""
@@ -520,3 +569,25 @@ class OSVScanner:
             if url:
                 refs.append(url)
         return refs[:5]  # Limit to 5 references
+
+    def _extract_affected_packages(self, vuln_data: dict) -> list[dict[str, str]]:
+        """Extract the ecosystem/name pairs OSV lists as affected.
+
+        De-duplicated, capped at `_MAX_AFFECTED_PACKAGES`.
+        """
+        packages: list[dict[str, str]] = []
+        seen: set[tuple[str, str]] = set()
+        for affected in vuln_data.get("affected", []):
+            pkg = affected.get("package", {})
+            name = pkg.get("name")
+            ecosystem = pkg.get("ecosystem")
+            if not name or not ecosystem:
+                continue
+            key = (ecosystem, name)
+            if key in seen:
+                continue
+            seen.add(key)
+            packages.append({"ecosystem": ecosystem, "name": name})
+            if len(packages) >= _MAX_AFFECTED_PACKAGES:
+                break
+        return packages
