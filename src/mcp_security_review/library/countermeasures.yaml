@@ -519,6 +519,8 @@ countermeasures:
       checkov: [CKV_AWS_103, CKV_AWS_2, CKV2_AWS_20, CKV_GCP_4, CKV_AZURE_218]
       prowler: [elbv2_insecure_ssl_ciphers, elbv2_ssl_listeners, elb_insecure_ssl_ciphers]
     compliance:
+      cis_azure: ["7.12"]
+      cis_gcp: ["3.11"]
       nist_800_53: [SC-8, SC-13]
 
   - id: lb-access-logs
@@ -528,15 +530,19 @@ countermeasures:
       bucket in the same region whose policy lets only the regional log delivery
       service write, with block public access and a lifecycle rule for retention.
       ALB log delivery needs SSE-S3 on that bucket, not a KMS key. On GCP set
-      log_config with enable = true on backend services.
+      log_config with enable = true on backend services; on Azure add an
+      azurerm_monitor_diagnostic_setting to each Application Gateway or Front Door
+      that sends its access log category (ApplicationGatewayAccessLog) to Log
+      Analytics or a storage account.
     effort: low
-    providers: [aws, gcp]
+    providers: [aws, azure, gcp]
     checks:
       checkov: [CKV_AWS_91, CKV_AWS_92]
       prowler: [elbv2_logging_enabled, elb_logging_enabled, compute_loadbalancer_logging_enabled]
       kics: [3e34db4f-0ad9-4290-bfd0-4a9ee884acaf, 20018359-6fd7-4d05-ab26-d4dffccbdf79]
     compliance:
       cis_aws: ["4.10"]
+      cis_azure: ["6.1.4"]
       cis_gcp: ["2.17"]
       nist_800_53: [AU-2, AU-12]
 
@@ -826,16 +832,28 @@ countermeasures:
       aws_db_instance and aws_rds_cluster when you create them (turning encryption on
       later needs a snapshot copy and restore), and set
       performance_insights_kms_key_id too. Snapshots can then be restored only by
-      accounts the key policy allows.
+      accounts the key policy allows. On Azure SQL keep TDE on with a Key Vault key
+      as the protector (azurerm_mssql_server_transparent_data_encryption with
+      key_vault_key_id), and give PostgreSQL or MySQL flexible servers a
+      customer_managed_key block. On GCP set encryption_key_name on the Cloud SQL
+      instance and default_encryption_configuration on BigQuery datasets to a
+      Cloud KMS key.
     effort: low
-    providers: [aws]
+    providers: [aws, azure, gcp]
     checks:
       trivy: [AVD-AWS-0080, AVD-AWS-0079, AVD-AWS-0078]
-      checkov: [CKV_AWS_16, CKV_AWS_327]
-      prowler: [rds_instance_storage_encrypted, rds_cluster_storage_encrypted]
+      checkov: [CKV_AWS_16, CKV_AWS_327, CKV2_AZURE_25, CKV2_AZURE_17, CKV2_AZURE_16, CKV_GCP_81]
+      prowler:
+        - rds_instance_storage_encrypted
+        - rds_cluster_storage_encrypted
+        - sqlserver_tde_encrypted_with_cmk
+        - sqlserver_tde_encryption_enabled
+        - cloudsql_instance_cmek_encryption_enabled
+        - bigquery_dataset_cmk_encryption
       kics: [3199c26c-7871-4cb3-99c2-10a59244ce7f, 656880aa-1388-488f-a6d4-8f73c23149b2]
     compliance:
       cis_aws: ["3.2.1"]
+      cis_gcp: ["7.3"]
       nist_800_53: [SC-28]
 
   - id: encrypt-queues-topics-and-logs
@@ -845,18 +863,23 @@ countermeasures:
       aws_cloudwatch_log_group and aws_secretsmanager_secret, using customer managed
       keys whose key policy lets that service use them (for log groups, the
       logs.<region>.amazonaws.com principal). Give each log group a
-      retention_in_days so logs are neither lost early nor kept forever.
+      retention_in_days so logs are neither lost early nor kept forever. On Azure
+      give Service Bus namespaces a customer_managed_key and encrypt the storage
+      account that holds exported activity logs with a Key Vault key; on GCP set
+      kms_key_name on Pub/Sub topics.
     effort: low
-    providers: [aws]
+    providers: [aws, azure, gcp]
     checks:
       trivy: [AVD-AWS-0096, AVD-AWS-0135, AVD-AWS-0095, AVD-AWS-0136, AVD-AWS-0017, AVD-AWS-0098]
-      checkov: [CKV_AWS_27, CKV_AWS_26, CKV_AWS_158, CKV_AWS_149, CKV_AWS_66]
+      checkov: [CKV_AWS_27, CKV_AWS_26, CKV_AWS_158, CKV_AWS_149, CKV_AWS_66, CKV_AZURE_201, CKV_GCP_83]
       prowler:
         - sqs_queues_server_side_encryption_enabled
         - sns_topics_kms_encryption_at_rest_enabled
         - cloudwatch_log_group_kms_encryption_enabled
         - cloudwatch_log_group_retention_policy_specific_days_enabled
+        - monitor_storage_account_with_activity_logs_cmk_encrypted
     compliance:
+      cis_azure: ["6.1.1.3"]
       nist_800_53: [SC-28, SC-12]
 
   - id: db-backups-and-deletion-protection
@@ -867,15 +890,27 @@ countermeasures:
       final_snapshot_identifier; turn on point_in_time_recovery for DynamoDB tables.
       Add lifecycle prevent_destroy to production data stores, and copy backups to
       another account or region with AWS Backup. On GCP enable backup_configuration
-      with point_in_time_recovery_enabled, and deletion_protection.
+      with point_in_time_recovery_enabled, and deletion_protection. On Azure set
+      backup_retention_days and geo_redundant_backup_enabled = true on PostgreSQL
+      and MySQL flexible servers, give Azure SQL databases short-term and long-term
+      retention policies, and add an azurerm_management_lock with lock_level =
+      "CanNotDelete" to production data stores.
     effort: low
-    providers: [aws, gcp]
+    providers: [aws, azure, gcp]
     checks:
-      trivy: [AVD-AWS-0077, AVD-AWS-0177, AVD-AWS-0343, AVD-GCP-0024]
-      checkov: [CKV_AWS_133, CKV_AWS_293, CKV_AWS_139, CKV_AWS_28, CKV_GCP_14]
-      prowler: [rds_instance_backup_enabled, rds_instance_deletion_protection, rds_cluster_deletion_protection, dynamodb_tables_pitr_enabled, cloudsql_instance_automated_backups]
+      trivy: [AVD-AWS-0077, AVD-AWS-0177, AVD-AWS-0343, AVD-AWS-0024, AVD-GCP-0024]
+      checkov: [CKV_AWS_133, CKV_AWS_293, CKV_AWS_139, CKV_AWS_28, CKV_GCP_14, CKV2_GCP_20, CKV_AZURE_136]
+      prowler:
+        - rds_instance_backup_enabled
+        - rds_instance_deletion_protection
+        - rds_cluster_deletion_protection
+        - dynamodb_tables_pitr_enabled
+        - cloudsql_instance_automated_backups
+        - postgresql_flexible_server_geo_redundant_backup_enabled
+        - mysql_flexible_server_geo_redundant_backup_enabled
       kics: [1dc73fb4-5b51-430c-8c5f-25dcf9090b02]
     compliance:
+      cis_azure: ["6.2"]
       cis_gcp: ["6.8"]
       nist_800_53: [CP-9, CP-10]
 
@@ -952,15 +987,17 @@ countermeasures:
   - id: non-root-minimal-images
     name: Run containers as non-root on minimal images
     how_to: >-
-      Create a user in the Dockerfile and end with USER set to a numeric UID (above
-      10000 also satisfies Kubernetes runAsNonRoot checks). Use a slim, distroless,
-      or scratch base and a multi-stage build so compilers, package managers, and
-      shells stay out of the final image, and drop capabilities you do not need.
+      Create a user in the Dockerfile and end with USER set to a numeric UID, so
+      Kubernetes runAsNonRoot can verify it is not root (it rejects a user name it
+      cannot resolve). High-UID scanner checks also want a UID above 10000 so it
+      cannot match a user on the host. Use a slim, distroless, or scratch base and a
+      multi-stage build so compilers, package managers, and shells stay out of the
+      final image, and drop capabilities you do not need.
     effort: low
     asvs: [v5.0.0-15.2.3]
     checks:
-      trivy: [AVD-DS-0002, AVD-KSV-0012]
-      checkov: [CKV_DOCKER_3, CKV_DOCKER_8, CKV_K8S_23]
+      trivy: [AVD-DS-0002, AVD-KSV-0012, AVD-KSV-0020]
+      checkov: [CKV_DOCKER_3, CKV_DOCKER_8, CKV_K8S_23, CKV_K8S_40]
       kics: [fd54f200-402c-4333-a5a4-36ef6709af2f, 67fd0c4a-68cf-46d7-8c41-bc9fba7e40ae]
     compliance:
       nist_800_53: [AC-6, CM-7]

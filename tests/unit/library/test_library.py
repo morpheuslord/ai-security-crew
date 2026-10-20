@@ -538,3 +538,54 @@ def test_no_scanner_text_copied(library: Library) -> None:
     for t in library.threats.values():
         for title in SCANNER_TITLES:
             assert title.lower().rstrip(".") != t.name.lower(), (t.id, title)
+
+
+def test_non_root_advice_cites_the_high_uid_checks(library: Library) -> None:
+    measure = library.countermeasures["non-root-minimal-images"]
+    assert measure.checks is not None
+    assert "AVD-KSV-0020" in measure.checks.trivy
+    assert "CKV_K8S_40" in measure.checks.checkov
+    # runAsNonRoot accepts any non-zero UID; only the high-UID checks want > 10000.
+    assert "satisfies Kubernetes runAsNonRoot" not in measure.how_to
+
+
+@pytest.mark.parametrize(
+    ("measure_id", "providers"),
+    [
+        ("encrypt-databases-at-rest", {"aws", "azure", "gcp"}),
+        ("encrypt-queues-topics-and-logs", {"aws", "azure", "gcp"}),
+        ("db-backups-and-deletion-protection", {"aws", "azure", "gcp"}),
+        ("lb-access-logs", {"aws", "azure", "gcp"}),
+    ],
+)
+def test_data_and_logging_entries_cover_every_cloud(
+    library: Library, measure_id: str, providers: set[str]
+) -> None:
+    measure = library.countermeasures[measure_id]
+    assert set(measure.providers) == providers
+    assert "On Azure" in measure.how_to or "on Azure" in measure.how_to
+    assert "GCP" in measure.how_to
+
+
+def test_alias_is_dropped_when_all_its_targets_are_disabled(tmp_path: Path) -> None:
+    folder = tmp_path / ".ai-security-crew" / "library"
+    folder.mkdir(parents=True)
+    (folder / "off.yaml").write_text(
+        "disable: [" + ", ".join(CLOUD_COMPONENTS) + "]\n", encoding="utf-8"
+    )
+    library = load_library(tmp_path)
+
+    assert "container-and-iac" not in library.components
+    assert "container-and-iac" not in [m["id"] for m in library.menu()]
+    with pytest.raises(UnknownComponentError):
+        library.resolve(["container-and-iac"])
+
+
+def test_alias_keeps_its_remaining_targets(tmp_path: Path) -> None:
+    folder = tmp_path / ".ai-security-crew" / "library"
+    folder.mkdir(parents=True)
+    (folder / "off.yaml").write_text("disable: [ci-pipeline]\n", encoding="utf-8")
+    library = load_library(tmp_path)
+
+    assert library.resolve(["container-and-iac"]).picked == CLOUD_COMPONENTS[:-1]
+    assert "container-and-iac" not in [m["id"] for m in library.menu()]

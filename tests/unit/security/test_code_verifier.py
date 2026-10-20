@@ -2,12 +2,16 @@
 
 import pytest
 
-from mcp_security_review.library import UnknownComponentError
+from mcp_security_review.library import Library, UnknownComponentError, load_library
 from mcp_security_review.security import CodeReviewContextBuilder
 
 
 def build(**kwargs):
     return CodeReviewContextBuilder().build_review_context(**kwargs)
+
+
+def context_library() -> Library:
+    return load_library()
 
 
 def test_no_components_gives_only_the_baseline_checklist() -> None:
@@ -98,9 +102,53 @@ def test_iac_checklist_is_not_cut_at_the_app_limit() -> None:
 
 
 def test_kubernetes_and_ci_use_the_iac_checklist() -> None:
-    for component in ("kubernetes", "ci-pipeline", "container-image"):
+    expected = {
+        "kubernetes": ("[Trivy AVD-KSV-", "Checkov CKV_K8S_", "KICS "),
+        "ci-pipeline": ("Checkov CKV2_GHA_1", "[KICS "),
+        "container-image": ("[Trivy AVD-DS-", "Checkov CKV_DOCKER_", "KICS "),
+    }
+    for component, markers in expected.items():
         joined = " ".join(build(components=[component]).security_checklist)
         assert "parameterized" not in joined.lower(), component
+        for marker in markers:
+            assert marker in joined, (component, marker)
+
+
+def test_mixed_app_and_iac_picks_keep_the_app_checklist() -> None:
+    context = build(components=["llm-integration", "cloud-iam"])
+    checklist = context.security_checklist
+    joined = " ".join(checklist).lower()
+
+    # The app baseline stays for the app half of the change ...
+    assert "parameterized" in joined
+    assert "validate all input on the server" in joined
+    assert "return generic errors to users" in joined
+    # ... and the infrastructure half gets items with scanner ids.
+    assert any("[Trivy " in i or "[Checkov " in i for i in checklist)
+    assert any("ssm:*" in i for i in checklist)
+    # App countermeasures stay plain, and nothing is listed twice.
+    llm_ids = {
+        m.id for m in context_library().resolve(["llm-integration"]).countermeasures
+    }
+    llm_items = [
+        i
+        for i in checklist
+        if any(
+            i.startswith(context_library().countermeasures[m].name + ":")
+            for m in llm_ids
+        )
+    ]
+    assert llm_items
+    assert all("[Trivy" not in i and "[Checkov" not in i for i in llm_items)
+    assert len(checklist) == len(set(checklist))
+
+
+def test_iac_only_picks_drop_the_app_baseline() -> None:
+    joined = " ".join(
+        build(components=["cloud-iam", "cloud-network"]).security_checklist
+    ).lower()
+    assert "parameterized" not in joined
+    assert "[trivy " in joined
 
 
 def test_app_components_keep_the_app_baseline() -> None:

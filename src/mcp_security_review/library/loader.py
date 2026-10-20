@@ -231,6 +231,13 @@ def _apply_disable(
     if not disabled:
         return components, threats, countermeasures
 
+    # An alias whose targets are all disabled stands for nothing; drop it too
+    # rather than let it reappear in the menu as an empty component.
+    disabled = disabled | {
+        k
+        for k, v in components.items()
+        if v.deprecated_alias_for and set(v.deprecated_alias_for) <= disabled
+    }
     components = {k: v for k, v in components.items() if k not in disabled}
     countermeasures = {k: v for k, v in countermeasures.items() if k not in disabled}
     components = {

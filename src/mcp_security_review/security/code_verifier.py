@@ -58,10 +58,10 @@ class CodeReviewContextBuilder:
 
         Returns:
             SecurityReviewContext with all information needed for AI review.
-            When a picked component is infrastructure code (see
-            `is_iac_component`), the checklist is the infrastructure one: each
-            item carries its scanner check ids, compliance ids, and false
-            positive note, and the app-code baseline is left out.
+            Countermeasures for threats on picked infrastructure components
+            (see `is_iac_component`) carry their scanner check ids, compliance
+            ids, and false positive note. When only infrastructure components
+            are picked, the app-code baseline is left out; mixed picks keep it.
 
         Raises:
             UnknownComponentError: If a component id is not in the library.
@@ -72,22 +72,42 @@ class CodeReviewContextBuilder:
         picked: list[str] = []
         covered: set[str] = set()
 
-        iac = False
+        iac_only = False
         if components:
             resolution = self._library.resolve(components, data_handled)
             picked = resolution.picked
-            iac = any(is_iac_component(c) for c in picked)
+            iac_picked = {c for c in picked if is_iac_component(c)}
+            iac_only = bool(iac_picked) and len(iac_picked) == len(picked)
             risk_level = resolution.risk_level.value
             focus_areas.extend(_focus_area(t, attack) for t in resolution.threats)
-            limit = MAX_IAC_CHECKS if iac else MAX_COMPONENT_CHECKS
-            for measure in resolution.countermeasures[:limit]:
-                checklist.append(_iac_item(measure) if iac else _item(measure))
+            # Countermeasures for a threat on a picked infrastructure component
+            # get the infrastructure format and limit; the rest stay app items.
+            iac_threats = {
+                t.id
+                for t in resolution.threats
+                if iac_picked.intersection(t.components)
+            }
+            iac_measures = [
+                m
+                for m in resolution.countermeasures
+                if iac_threats.intersection(resolution.mitigates[m.id])
+            ]
+            iac_ids = {m.id for m in iac_measures}
+            app_measures = [
+                m for m in resolution.countermeasures if m.id not in iac_ids
+            ]
+            for measure in iac_measures[:MAX_IAC_CHECKS]:
+                checklist.append(_iac_item(measure))
+                covered.add(measure.id)
+            for measure in app_measures[:MAX_COMPONENT_CHECKS]:
+                checklist.append(_item(measure))
                 covered.add(measure.id)
 
-        # Infrastructure code keeps only the provider-neutral baseline items
-        # (secrets and logging); the rest of the baseline is about app code.
+        # Infrastructure-only picks keep only the provider-neutral baseline items
+        # (secrets and logging); the rest of the baseline is about app code, so
+        # a pick that also names app components keeps all of it.
         for measure in self._library.baseline_countermeasures():
-            if measure.id in covered or (iac and "any" not in measure.providers):
+            if measure.id in covered or (iac_only and "any" not in measure.providers):
                 continue
             checklist.append(_item(measure))
 
