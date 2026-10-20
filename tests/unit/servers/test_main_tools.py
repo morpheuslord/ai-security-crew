@@ -6,6 +6,7 @@ from mcp_security_review.servers.main import AGENT_INSTRUCTIONS, main_mcp
 
 EXPECTED_TOOLS = {
     "general_lightweight_security_review",
+    "general_project_context",
     "general_verify_code_security",
     "sca_assess_packages",
     "sca_lookup_vulnerability",
