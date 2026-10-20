@@ -17,6 +17,8 @@ from pydantic import Field
 from mcp_security_review.errors import tool_error
 from mcp_security_review.providers.intel import (
     ExploitContext,
+    PackageAssessment,
+    assess_package,
     build_exploit_contexts,
     new_client,
 )
@@ -33,6 +35,7 @@ _VULN_ID_RE = re.compile(
     r"|[A-Z][A-Z0-9]*-[A-Za-z0-9._:-]{1,64})$"
 )
 _MAX_LOOKUP_IDS = 20
+_MAX_ASSESS_PACKAGES = 25
 _UNVERIFIED_STATUSES = frozenset(
     {
         "unverified_sha",
@@ -182,6 +185,116 @@ async def verify_packages(
         )
     if actions:
         response["action_required"] = " ".join(actions)
+    return json.dumps(response, indent=2, ensure_ascii=False)
+
+
+def _failed_assessment(pkg: dict) -> PackageAssessment:
+    """A fallback assessment for a package whose assessment raised.
+
+    `assess_package` is documented not to raise; this is the last-resort
+    fallback so a bug in one package's assessment never fails the batch
+    or the whole tool call.
+    """
+    return PackageAssessment(
+        name=str(pkg.get("name", "")),
+        version=str(pkg.get("version", "")),
+        ecosystem=str(pkg.get("ecosystem", "pypi")),
+        exists=False,
+        deprecated=None,
+        deprecated_reason=None,
+        licenses=[],
+        license_class="unknown",
+        advisories=[],
+        provenance=None,
+        source_repo=None,
+        scorecard=None,
+        dependencies=None,
+        adoption_notes=[],
+        sources={"deps_dev": "unavailable: error"},
+    )
+
+
+@sca_mcp.tool(tags={"security", "sca", "assessment"})
+async def assess_packages(
+    ctx: Context,
+    packages_json: Annotated[
+        str,
+        Field(
+            description=(
+                "JSON array of packages to assess before adopting them. "
+                "Each object needs: 'name', 'version', and 'ecosystem': "
+                "'pypi', 'npm', or 'github-actions' (name 'owner/repo', "
+                "version the action's ref). 'container' and other "
+                "ecosystems are not supported and are noted, not scanned. "
+                "Up to 25 packages per call. Example: "
+                '[{"name": "requests", "version": "2.31.0", '
+                '"ecosystem": "pypi"}]'
+            )
+        ),
+    ],
+) -> str:
+    """Gather pre-adoption signal for packages from deps.dev and Scorecard.
+
+    For each package, reports its license and license class, whether the
+    registry marks it deprecated, SLSA provenance or attestation, the
+    OpenSSF Scorecard for its source repository (score, date, and its
+    weakest checks), and its dependency-graph shape (direct and
+    transitive counts, and any deprecated direct dependencies).
+
+    This is not a verdict and not an existence check (use
+    `sca_verify_packages` for that): it is signal for a human or agent to
+    weigh before adopting a new dependency. Every source is best effort;
+    a failure on one source, or one package, never affects the others.
+
+    Args:
+        ctx: The FastMCP context.
+        packages_json: JSON array of package objects to assess.
+
+    Returns:
+        JSON with `packages_assessed` and `results` (one assessment per
+        package, each with `adoption_notes` flagging concerns such as
+        deprecation, missing provenance, a low Scorecard, a copyleft or
+        unknown license, or a large or deprecated dependency tree).
+    """
+    packages = _parse_packages(packages_json)
+    if isinstance(packages, str):
+        return packages
+    if len(packages) > _MAX_ASSESS_PACKAGES:
+        return tool_error(
+            "too_many_packages",
+            f"Got {len(packages)} packages; at most "
+            f"{_MAX_ASSESS_PACKAGES} are allowed per call.",
+            "Split the packages across multiple calls.",
+        )
+
+    client = new_client()
+    try:
+        results: list[PackageAssessment] = []
+        for pkg in packages:
+            try:
+                result = await assess_package(
+                    client,
+                    pkg["name"],
+                    pkg["version"],
+                    pkg.get("ecosystem", "pypi"),
+                )
+            except Exception:  # a bad package must not fail the whole batch
+                logger.exception("Package assessment failed for %s", pkg.get("name"))
+                result = _failed_assessment(pkg)
+            results.append(result)
+    finally:
+        await client.aclose()
+
+    response: dict[str, Any] = {
+        "success": True,
+        "packages_assessed": len(results),
+        "results": [r.to_dict() for r in results],
+        "instructions": (
+            "These are inputs to weigh, not a verdict. Raise copyleft, "
+            "deprecated, or low-Scorecard packages with the user before "
+            "adopting them."
+        ),
+    }
     return json.dumps(response, indent=2, ensure_ascii=False)
 
 

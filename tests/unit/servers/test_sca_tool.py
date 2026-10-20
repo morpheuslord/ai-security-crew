@@ -10,7 +10,7 @@ import pytest
 from fastmcp import Client
 
 from mcp_security_review.guard.clip import OMITTED
-from mcp_security_review.providers.intel import ExploitContext
+from mcp_security_review.providers.intel import ExploitContext, PackageAssessment
 from mcp_security_review.providers.sca.osv import (
     OSVScanner,
     ScanResult,
@@ -102,7 +102,9 @@ async def call_tool(tool: str, **args: Any) -> dict[str, Any]:
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize("tool", ["sca_scan_dependencies", "sca_verify_packages"])
+@pytest.mark.parametrize(
+    "tool", ["sca_scan_dependencies", "sca_verify_packages", "sca_assess_packages"]
+)
 async def test_bad_json_returns_shared_error_with_example(tool: str) -> None:
     data = await call_tool(tool, packages_json="not json")
     assert data["success"] is False
@@ -111,7 +113,9 @@ async def test_bad_json_returns_shared_error_with_example(tool: str) -> None:
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize("tool", ["sca_scan_dependencies", "sca_verify_packages"])
+@pytest.mark.parametrize(
+    "tool", ["sca_scan_dependencies", "sca_verify_packages", "sca_assess_packages"]
+)
 async def test_wrong_shape_returns_invalid_packages(tool: str) -> None:
     data = await call_tool(tool, packages_json='["requests"]')
     assert data["error"]["code"] == "invalid_packages"
@@ -527,7 +531,9 @@ async def test_scan_accepts_github_actions_ecosystem() -> None:
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize("tool", ["sca_scan_dependencies", "sca_verify_packages"])
+@pytest.mark.parametrize(
+    "tool", ["sca_scan_dependencies", "sca_verify_packages", "sca_assess_packages"]
+)
 @pytest.mark.parametrize(
     "package",
     [
@@ -548,3 +554,103 @@ async def test_non_string_fields_rejected(tool: str, package: dict) -> None:
         data = await call_tool(tool, packages_json=json.dumps([package]))
     assert data["success"] is False
     assert data["error"]["code"] == "invalid_packages"
+
+
+# ---- sca_assess_packages ----
+
+
+def _assessment(**kw: Any) -> PackageAssessment:
+    base: dict[str, Any] = {
+        "name": "requests",
+        "version": "2.31.0",
+        "ecosystem": "pypi",
+        "exists": True,
+        "deprecated": False,
+        "deprecated_reason": None,
+        "licenses": ["Apache-2.0"],
+        "license_class": "permissive",
+        "advisories": [],
+        "provenance": True,
+        "source_repo": "github.com/psf/requests",
+        "scorecard": {"score": 8.2, "date": "2026-10-12", "weakest": []},
+        "dependencies": {"direct": 1, "transitive": 1, "deprecated": []},
+        "adoption_notes": [],
+        "sources": {"deps_dev": "ok", "scorecard": "ok", "dependencies": "ok"},
+    }
+    base.update(kw)
+    return PackageAssessment(**base)
+
+
+@pytest.mark.anyio
+async def test_assess_packages_returns_results_and_instructions() -> None:
+    async def fake_assess(
+        client: Any, name: str, version: str, ecosystem: str
+    ) -> PackageAssessment:
+        return _assessment(name=name, version=version, ecosystem=ecosystem)
+
+    with patch("mcp_security_review.servers.sca.assess_package", fake_assess):
+        data = await call_tool("sca_assess_packages", packages_json=PKGS)
+
+    assert data["success"] is True
+    assert data["packages_assessed"] == 1
+    result = data["results"][0]
+    assert result["license_class"] == "permissive"
+    assert result["scorecard"]["score"] == 8.2
+    assert "instructions" in data
+    assert "not a verdict" in data["instructions"]
+
+
+@pytest.mark.anyio
+async def test_assess_packages_one_failure_does_not_fail_others() -> None:
+    packages = json.dumps(
+        [
+            {"name": "good", "version": "1.0.0", "ecosystem": "pypi"},
+            {"name": "bad", "version": "1.0.0", "ecosystem": "pypi"},
+        ]
+    )
+
+    async def fake_assess(
+        client: Any, name: str, version: str, ecosystem: str
+    ) -> PackageAssessment:
+        if name == "bad":
+            raise RuntimeError("boom")
+        return _assessment(name=name, version=version, ecosystem=ecosystem)
+
+    with patch("mcp_security_review.servers.sca.assess_package", fake_assess):
+        data = await call_tool("sca_assess_packages", packages_json=packages)
+
+    assert data["success"] is True
+    assert data["packages_assessed"] == 2
+    names = [r["name"] for r in data["results"]]
+    assert names == ["good", "bad"]
+    bad_result = data["results"][1]
+    assert bad_result["exists"] is False
+    assert bad_result["sources"]["deps_dev"] == "unavailable: error"
+
+
+@pytest.mark.anyio
+async def test_tool_cap_25() -> None:
+    packages = json.dumps(
+        [
+            {"name": f"pkg{i}", "version": "1.0.0", "ecosystem": "pypi"}
+            for i in range(26)
+        ]
+    )
+
+    async def no_lookup(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("a lookup ran for a call over the cap")
+
+    with patch("mcp_security_review.servers.sca.assess_package", no_lookup):
+        data = await call_tool("sca_assess_packages", packages_json=packages)
+
+    assert data["success"] is False
+    assert data["error"]["code"] == "too_many_packages"
+
+
+@pytest.mark.anyio
+async def test_assess_packages_description_lists_ecosystems() -> None:
+    async with Client(main_mcp) as client:
+        tools = {t.name: t for t in await client.list_tools()}
+    described = json.dumps(tools["sca_assess_packages"].inputSchema)
+    for ecosystem in ("pypi", "npm", "github-actions"):
+        assert ecosystem in described

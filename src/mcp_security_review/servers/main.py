@@ -119,7 +119,8 @@ AGENT_INSTRUCTIONS = (
     "2. Call `sca_scan_dependencies` in parallel with step 3 — scans for CVEs. Each finding has a `reachability_check`; answer it from your own code:\n"  # noqa: E501
     "   - affected symbols are used, or you cannot tell → upgrade to the fixed version or avoid the symbol before continuing.\n"  # noqa: E501
     "   - symbols are not used → note it and continue; consider upgrading anyway.\n"  # noqa: E501
-    "- Already have an id? Call `sca_lookup_vulnerability` instead of re-scanning.\n\n"  # noqa: E501
+    "- Already have an id? Call `sca_lookup_vulnerability` instead of re-scanning.\n"  # noqa: E501
+    "- Before adopting a brand-new dependency, call `sca_assess_packages` for its license, provenance, Scorecard, and dependency-tree signal.\n\n"  # noqa: E501
     "## 3. After generating code\n"
     "Call `general_verify_code_security` with the same `components`. Do not paste code: it returns a checklist, and you review the code you wrote against it.\n"  # noqa: E501
     "- Run this after every non-trivial code generation before presenting results to the user.\n"  # noqa: E501

@@ -18,11 +18,14 @@ from mcp_security_review.providers import attack, intel
 from mcp_security_review.providers.intel import (
     CTID_RAW,
     CTID_TREE_API,
+    DEPSDEV,
     HOSTNAME_RE,
+    SCORECARD,
     ExploitContext,
     FetchError,
     IntelCache,
     UnsafeHostError,
+    assess_package,
     build_exploit_contexts,
     check_public_host,
     fetch_bytes,
@@ -1213,3 +1216,401 @@ async def test_fetch_intel_only_requested_sources(
     statuses = await fetch_intel(cache, sources=("kev",))
 
     assert statuses == {"kev": "ok"}
+
+
+# ---- deps.dev and Scorecard ----
+
+_REQUESTS_VERSION = {
+    "versionKey": {"system": "PYPI", "name": "requests", "version": "2.31.0"},
+    "publishedAt": "2023-05-22T12:00:00Z",
+    "isDefault": True,
+    "isDeprecated": False,
+    "deprecatedReason": None,
+    "licenses": ["Apache-2.0"],
+    "advisoryKeys": [{"id": "GHSA-9hjg-9r4m-mvj7"}],
+    "links": {},
+    "slsaProvenances": [],
+    "attestations": [],
+    "registries": [],
+    "relatedProjects": [
+        {
+            "projectKey": {"id": "github.com/psf/requests"},
+            "relationProvenance": "UNVERIFIED_METADATA",
+            "relationType": "SOURCE_REPO",
+        }
+    ],
+    "projectStatus": {},
+}
+
+_REQUESTS_PROJECT = {
+    "projectKey": {"id": "github.com/psf/requests"},
+    "openIssuesCount": 100,
+    "starsCount": 50000,
+    "forksCount": 9000,
+    "license": "Apache-2.0",
+    "description": "Python HTTP for Humans.",
+    "homepage": "https://requests.readthedocs.io",
+    "scorecard": {
+        "date": "2026-10-12",
+        "overallScore": 8.2,
+        "checks": [
+            {"name": "Code-Review", "score": 9, "reason": "r"},
+            {"name": "Maintained", "score": 10, "reason": "r"},
+            {"name": "Vulnerabilities", "score": 10, "reason": "r"},
+            {"name": "License", "score": -1, "reason": "n/a"},
+        ],
+    },
+    "ossFuzz": {},
+}
+
+_REQUESTS_DEPS = {
+    "nodes": [
+        {
+            "versionKey": {"system": "PYPI", "name": "requests", "version": "2.31.0"},
+            "bundled": False,
+            "relation": "SELF",
+            "errors": [],
+        },
+        {
+            "versionKey": {"system": "PYPI", "name": "urllib3", "version": "2.0.3"},
+            "bundled": False,
+            "relation": "DIRECT",
+            "errors": [],
+        },
+        {
+            "versionKey": {"system": "PYPI", "name": "idna", "version": "3.4"},
+            "bundled": False,
+            "relation": "INDIRECT",
+            "errors": [],
+        },
+    ],
+    "edges": [],
+    "error": "",
+}
+
+_EMPTY_DEPS = {"nodes": [], "edges": [], "error": ""}
+
+
+def _routed_client(
+    routes: dict[str, Any], *, default_status: int = 404
+) -> httpx.AsyncClient:
+    """A client answering by URL suffix, from `{suffix: json_body}`."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        for suffix, body in routes.items():
+            if url.endswith(suffix):
+                return httpx.Response(200, json=body)
+        return httpx.Response(default_status)
+
+    return httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+
+@pytest.mark.anyio
+async def test_requests_fixture_permissive_with_scorecard() -> None:
+    async with _routed_client(
+        {
+            "/systems/pypi/packages/requests/versions/2.31.0": _REQUESTS_VERSION,
+            "/projects/github.com%2Fpsf%2Frequests": _REQUESTS_PROJECT,
+            ":dependencies": _REQUESTS_DEPS,
+        }
+    ) as c:
+        result = await assess_package(c, "requests", "2.31.0", "pypi")
+
+    assert result.exists is True
+    assert result.licenses == ["Apache-2.0"]
+    assert result.license_class == "permissive"
+    assert result.advisories == ["GHSA-9hjg-9r4m-mvj7"]
+    assert result.source_repo == "github.com/psf/requests"
+    assert result.scorecard == {
+        "score": 8.2,
+        "date": "2026-10-12",
+        "weakest": [
+            {"name": "Code-Review", "score": 9},
+            {"name": "Maintained", "score": 10},
+            {"name": "Vulnerabilities", "score": 10},
+        ],
+    }
+    assert result.dependencies == {"direct": 1, "transitive": 1, "deprecated": []}
+    assert result.sources["deps_dev"] == "ok"
+    assert result.sources["scorecard"] == "ok"
+    assert result.sources["dependencies"] == "ok"
+    # Requests' real slsaProvenances/attestations are both empty.
+    assert result.provenance is False
+    assert "no provenance or attestation" in result.adoption_notes
+
+
+@pytest.mark.anyio
+async def test_deprecated_npm_request_flagged() -> None:
+    npm_request_version = {
+        "versionKey": {"system": "NPM", "name": "request", "version": "2.88.2"},
+        "isDefault": False,
+        "isDeprecated": True,
+        "deprecatedReason": "request has been deprecated, see https://example/",
+        "licenses": ["Apache-2.0"],
+        "advisoryKeys": [],
+        "relatedProjects": [],
+    }
+    async with _routed_client(
+        {
+            "/systems/npm/packages/request/versions/2.88.2": npm_request_version,
+            ":dependencies": _EMPTY_DEPS,
+        }
+    ) as c:
+        result = await assess_package(c, "request", "2.88.2", "npm")
+
+    assert result.deprecated is True
+    assert result.deprecated_reason is not None
+    assert "deprecated" in result.adoption_notes
+    # No relatedProjects entry: Scorecard is never attempted.
+    assert "scorecard" not in result.sources
+
+
+@pytest.mark.anyio
+async def test_gpl_flagged_copyleft() -> None:
+    gpl_version = {
+        "versionKey": {"system": "PYPI", "name": "somepkg", "version": "1.0.0"},
+        "isDeprecated": False,
+        "licenses": ["GPL-3.0-only"],
+        "advisoryKeys": [],
+        "relatedProjects": [],
+    }
+    async with _routed_client(
+        {
+            "/systems/pypi/packages/somepkg/versions/1.0.0": gpl_version,
+            ":dependencies": _EMPTY_DEPS,
+        }
+    ) as c:
+        result = await assess_package(c, "somepkg", "1.0.0", "pypi")
+
+    assert result.license_class == "copyleft"
+    assert "copyleft licence: raise with the user" in result.adoption_notes
+
+
+@pytest.mark.anyio
+async def test_missing_package_exists_false() -> None:
+    async with _routed_client({}) as c:
+        result = await assess_package(c, "nonexistent-pkg-xyz", "1.0.0", "pypi")
+
+    assert result.exists is False
+    assert result.sources["deps_dev"] == "not_found"
+    assert result.dependencies is None
+    assert result.license_class == "unknown"
+    assert "licence unknown" in result.adoption_notes
+
+
+@pytest.mark.anyio
+async def test_scorecard_down_marks_source() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        if url.endswith("/systems/pypi/packages/requests/versions/2.31.0"):
+            return httpx.Response(200, json=_REQUESTS_VERSION)
+        if url.endswith(":dependencies"):
+            return httpx.Response(200, json=_EMPTY_DEPS)
+        if url.endswith("/projects/github.com%2Fpsf%2Frequests"):
+            return httpx.Response(503)
+        return httpx.Response(404)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as c:
+        result = await assess_package(c, "requests", "2.31.0", "pypi")
+
+    assert result.exists is True
+    assert result.scorecard is None
+    assert result.sources["scorecard"] == "unavailable: http_503"
+
+
+@pytest.mark.anyio
+async def test_action_assess_uses_scorecard_only() -> None:
+    seen_urls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen_urls.append(str(request.url))
+        if str(request.url) == f"{SCORECARD}/github.com/actions/checkout":
+            return httpx.Response(
+                200,
+                json={
+                    "date": "2026-10-12",
+                    "score": 6.3,
+                    "checks": [
+                        {"name": "Code-Review", "score": 8},
+                        {"name": "Maintained", "score": 10},
+                    ],
+                },
+            )
+        return httpx.Response(404)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as c:
+        result = await assess_package(c, "actions/checkout", "v4", "github-actions")
+
+    assert result.source_repo == "github.com/actions/checkout"
+    assert result.scorecard == {
+        "score": 6.3,
+        "date": "2026-10-12",
+        "weakest": [
+            {"name": "Code-Review", "score": 8},
+            {"name": "Maintained", "score": 10},
+        ],
+    }
+    assert result.dependencies is None
+    assert result.exists is True
+    assert not any("deps.dev" in url for url in seen_urls)
+
+
+@pytest.mark.anyio
+async def test_name_with_slash_is_encoded() -> None:
+    seen_urls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen_urls.append(str(request.url))
+        return httpx.Response(404)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as c:
+        await assess_package(c, "@scope/pkg", "1.0.0", "npm")
+
+    expected = f"{DEPSDEV}/systems/npm/packages/%40scope%2Fpkg/versions/1.0.0"
+    assert expected in seen_urls
+
+
+@pytest.mark.anyio
+async def test_container_ecosystem_is_unsupported_not_a_failure() -> None:
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda r: httpx.Response(404))
+    ) as c:
+        result = await assess_package(c, "python", "3.12-slim", "container")
+
+    assert result.exists is False
+    assert result.sources == {"deps_dev": "unsupported_ecosystem"}
+    assert result.adoption_notes == []
+
+
+@pytest.mark.anyio
+async def test_transitive_counts_indirect_only_direct_not_double_counted() -> None:
+    async with _routed_client(
+        {
+            "/systems/pypi/packages/requests/versions/2.31.0": _REQUESTS_VERSION,
+            ":dependencies": _REQUESTS_DEPS,
+        }
+    ) as c:
+        result = await assess_package(c, "requests", "2.31.0", "pypi")
+
+    # _REQUESTS_DEPS has one SELF, one DIRECT, one INDIRECT node.
+    assert result.dependencies == {"direct": 1, "transitive": 1, "deprecated": []}
+
+
+@pytest.mark.anyio
+async def test_dependency_graph_flags_deprecated_direct_dependency() -> None:
+    deps_graph = {
+        "nodes": [
+            {
+                "versionKey": {"system": "PYPI", "name": "somepkg", "version": "1.0.0"},
+                "relation": "SELF",
+            },
+            {
+                "versionKey": {"system": "PYPI", "name": "olddep", "version": "0.1.0"},
+                "relation": "DIRECT",
+            },
+        ],
+        "edges": [],
+        "error": "",
+    }
+    version_info = {
+        "versionKey": {"system": "PYPI", "name": "somepkg", "version": "1.0.0"},
+        "isDeprecated": False,
+        "licenses": ["MIT"],
+        "advisoryKeys": [],
+        "relatedProjects": [],
+    }
+    olddep_info = {
+        "versionKey": {"system": "PYPI", "name": "olddep", "version": "0.1.0"},
+        "isDeprecated": True,
+    }
+
+    async with _routed_client(
+        {
+            "/systems/pypi/packages/somepkg/versions/1.0.0": version_info,
+            "/systems/pypi/packages/olddep/versions/0.1.0": olddep_info,
+            ":dependencies": deps_graph,
+        }
+    ) as c:
+        result = await assess_package(c, "somepkg", "1.0.0", "pypi")
+
+    assert result.dependencies == {
+        "direct": 1,
+        "transitive": 0,
+        "deprecated": ["olddep"],
+    }
+    assert "has deprecated dependencies" in result.adoption_notes
+
+
+@pytest.mark.anyio
+async def test_scorecard_below_four_flagged() -> None:
+    low_project = {
+        "projectKey": {"id": "github.com/example/low-score"},
+        "scorecard": {
+            "date": "2026-10-12",
+            "overallScore": 3.1,
+            "checks": [{"name": "Maintained", "score": 2, "reason": "r"}],
+        },
+    }
+    version_info = {
+        "versionKey": {"system": "PYPI", "name": "lowscorepkg", "version": "1.0.0"},
+        "isDeprecated": False,
+        "licenses": ["MIT"],
+        "advisoryKeys": [],
+        "relatedProjects": [
+            {
+                "projectKey": {"id": "github.com/example/low-score"},
+                "relationType": "SOURCE_REPO",
+            }
+        ],
+    }
+
+    async with _routed_client(
+        {
+            "/systems/pypi/packages/lowscorepkg/versions/1.0.0": version_info,
+            "/projects/github.com%2Fexample%2Flow-score": low_project,
+            ":dependencies": _EMPTY_DEPS,
+        }
+    ) as c:
+        result = await assess_package(c, "lowscorepkg", "1.0.0", "pypi")
+
+    assert result.scorecard["score"] == 3.1
+    assert "Scorecard below 4" in result.adoption_notes
+
+
+@pytest.mark.anyio
+async def test_maintained_check_zero_flagged() -> None:
+    project = {
+        "projectKey": {"id": "github.com/example/unmaintained"},
+        "scorecard": {
+            "date": "2026-10-12",
+            "overallScore": 5.0,
+            "checks": [
+                {"name": "Maintained", "score": 0, "reason": "r"},
+                {"name": "Code-Review", "score": 8, "reason": "r"},
+            ],
+        },
+    }
+    version_info = {
+        "versionKey": {"system": "PYPI", "name": "unmaintainedpkg", "version": "1.0.0"},
+        "isDeprecated": False,
+        "licenses": ["MIT"],
+        "advisoryKeys": [],
+        "relatedProjects": [
+            {
+                "projectKey": {"id": "github.com/example/unmaintained"},
+                "relationType": "SOURCE_REPO",
+            }
+        ],
+    }
+
+    async with _routed_client(
+        {
+            "/systems/pypi/packages/unmaintainedpkg/versions/1.0.0": version_info,
+            "/projects/github.com%2Fexample%2Funmaintained": project,
+            ":dependencies": _EMPTY_DEPS,
+        }
+    ) as c:
+        result = await assess_package(c, "unmaintainedpkg", "1.0.0", "pypi")
+
+    assert "Maintained check scores 0" in result.adoption_notes

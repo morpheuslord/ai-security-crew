@@ -23,7 +23,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 
 import anyio
 import httpx
@@ -1285,3 +1285,660 @@ async def fetch_intel(
             key, ttl, refresh = spec
             statuses[name] = await _prefetch_one(active_cache, key, ttl, force, refresh)
     return statuses
+
+
+# ---- deps.dev and Scorecard ----
+
+DEPSDEV = "https://api.deps.dev/v3"
+SCORECARD = "https://api.securityscorecards.dev/projects"
+
+_DEPSDEV_MAX_BYTES = 2 * 1024 * 1024
+_DEPS_MAX_BYTES = 5 * 1024 * 1024
+_SCORECARD_MAX_BYTES = 1 * 1024 * 1024
+
+_MAX_DEP_LOOKUPS = 25
+_DEP_LOOKUP_CONCURRENCY = 8
+
+# Mirrors the alias sets in `providers/sca/registry.py`. Duplicated rather
+# than imported: that module imports from this one, so importing it back
+# here at module scope would be circular.
+_PYPI_ALIASES = frozenset({"pypi", "pip", "python"})
+_NPM_ALIASES = frozenset({"npm", "node", "javascript", "js"})
+_ACTIONS_ALIASES = frozenset({"github-actions", "actions", "gha"})
+
+_PERMISSIVE_LICENSES = frozenset(
+    {
+        "MIT",
+        "Apache-2.0",
+        "BSD-2-Clause",
+        "BSD-3-Clause",
+        "ISC",
+        "0BSD",
+        "Unlicense",
+        "Python-2.0",
+        "PSF-2.0",
+        "Zlib",
+        "MPL-2.0",  # file-level ("weak") copyleft; treated as permissive here
+    }
+)
+_COPYLEFT_PREFIXES = ("GPL", "AGPL", "LGPL", "EUPL", "SSPL", "OSL")
+
+_SOURCE_REPO_RE = re.compile(r"^github\.com/[A-Za-z0-9-]{1,39}/[A-Za-z0-9._-]{1,100}$")
+_ACTION_NAME_PREFIX_RE = re.compile(r"^([A-Za-z0-9-]{1,39})/([A-Za-z0-9._-]{1,100})")
+
+_LICENSE_TEXT_LIMIT = 100
+_ADVISORY_ID_LIMIT = 100
+_REASON_TEXT_LIMIT = 300
+_CHECK_NAME_LIMIT = 80
+_DATE_LIMIT = 40
+_MAX_LICENSES = 20
+_MAX_ADVISORIES = 50
+_MAX_WEAKEST_CHECKS = 5
+_TRANSITIVE_DEPENDENCY_LIMIT = 100
+
+
+@dataclass
+class PackageAssessment:
+    """Pre-adoption signal for one package, from deps.dev and Scorecard.
+
+    This is not a verdict: it is a bundle of inputs (license, provenance,
+    maintenance signal, dependency shape) meant to be weighed by whoever
+    decides whether to adopt the package. Every source is best effort;
+    see `sources`.
+
+    Attributes:
+        name: The package name, or `owner/repo[/path]` for `github-actions`.
+        version: The version string, or the action's ref.
+        ecosystem: The ecosystem exactly as given by the caller.
+        exists: Whether deps.dev (or, for `github-actions`, the derived
+            `owner/repo`) confirmed this name and version. Not a
+            substitute for `sca_verify_packages`.
+        deprecated: Whether the registry marks this version deprecated,
+            or `None` when that could not be determined.
+        deprecated_reason: The registry's deprecation message, clipped
+            with `untrusted`, or `None`.
+        licenses: SPDX license identifiers reported for this version.
+        license_class: `"permissive"`, `"copyleft"`, or `"unknown"`.
+        advisories: Advisory ids (e.g. GHSA ids) deps.dev links to this
+            version.
+        provenance: Whether deps.dev records SLSA provenance or an
+            attestation for this version, or `None` when unknown.
+        source_repo: The `github.com/{owner}/{repo}` key used for
+            Scorecard, or `None` when none was found or it did not match
+            the strict pattern.
+        scorecard: `{"score", "date", "weakest"}` where `weakest` is up
+            to 5 `{"name", "score"}` checks (excluding not-applicable `-1`
+            scores), or `None` when no Scorecard data was found.
+        dependencies: `{"direct", "transitive", "deprecated"}`: counts of
+            direct and transitive dependency-graph nodes, and names of
+            direct dependencies found to be deprecated (checked for up to
+            `_MAX_DEP_LOOKUPS` direct dependencies, `_DEP_LOOKUP_CONCURRENCY`
+            at a time). `None` when the dependency graph could not be
+            fetched or does not apply (`github-actions`).
+        adoption_notes: Exact-string flags worth raising with whoever is
+            deciding whether to adopt this package; see `_adoption_notes`.
+        sources: Per-source status (`"ok"`, `"not_found"`, or
+            `"unavailable: <reason>"`), keyed by `"deps_dev"`,
+            `"scorecard"`, and `"dependencies"`. A source absent from this
+            mapping was never attempted (for example, `"scorecard"` when
+            no source repository was found).
+    """
+
+    name: str
+    version: str
+    ecosystem: str
+    exists: bool
+    deprecated: bool | None
+    deprecated_reason: str | None
+    licenses: list[str]
+    license_class: str
+    advisories: list[str]
+    provenance: bool | None
+    source_repo: str | None
+    scorecard: dict[str, Any] | None
+    dependencies: dict[str, Any] | None
+    adoption_notes: list[str]
+    sources: dict[str, str]
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialise this assessment as a plain, JSON-serialisable dict."""
+        return {
+            "name": self.name,
+            "version": self.version,
+            "ecosystem": self.ecosystem,
+            "exists": self.exists,
+            "deprecated": self.deprecated,
+            "deprecated_reason": self.deprecated_reason,
+            "licenses": self.licenses,
+            "license_class": self.license_class,
+            "advisories": self.advisories,
+            "provenance": self.provenance,
+            "source_repo": self.source_repo,
+            "scorecard": self.scorecard,
+            "dependencies": self.dependencies,
+            "adoption_notes": self.adoption_notes,
+            "sources": self.sources,
+        }
+
+
+def _normalize_assess_ecosystem(ecosystem: str) -> str | None:
+    """Map an ecosystem string (and its aliases) to a canonical name.
+
+    Returns:
+        `"pypi"`, `"npm"`, or `"github-actions"`; `None` for anything
+        else (including `"container"`), which callers must treat as
+        unsupported rather than failing.
+    """
+    eco = str(ecosystem).lower().strip()
+    if eco in _PYPI_ALIASES:
+        return "pypi"
+    if eco in _NPM_ALIASES:
+        return "npm"
+    if eco in _ACTIONS_ALIASES:
+        return "github-actions"
+    return None
+
+
+def _license_class(licenses: list[str]) -> str:
+    """Classify a package's licenses as permissive, copyleft, or unknown.
+
+    Any SPDX id with a copyleft prefix (`GPL`, `AGPL`, `LGPL`, `EUPL`,
+    `SSPL`, `OSL`) anywhere in `licenses` makes the whole result
+    `"copyleft"`, since that is the stricter obligation to flag. `MPL-2.0`
+    is file-level ("weak") copyleft but is classified permissive here.
+    """
+    if not licenses:
+        return "unknown"
+    saw_permissive = False
+    for lic in licenses:
+        if any(lic.startswith(prefix) for prefix in _COPYLEFT_PREFIXES):
+            return "copyleft"
+        if lic in _PERMISSIVE_LICENSES:
+            saw_permissive = True
+    return "permissive" if saw_permissive else "unknown"
+
+
+def _weakest_checks(checks: Any) -> list[dict[str, Any]]:
+    """Up to 5 lowest-scoring Scorecard checks, excluding `-1` (n/a).
+
+    Each check's original numeric type (int or float) is kept; only the
+    sort key is coerced to float.
+    """
+    scored: list[tuple[float, int | float, str]] = []
+    if isinstance(checks, list):
+        for check in checks:
+            if not isinstance(check, dict):
+                continue
+            name = check.get("name")
+            score = check.get("score")
+            if not isinstance(name, str) or not isinstance(score, int | float):
+                continue
+            if isinstance(score, bool) or score < 0:
+                continue
+            scored.append((float(score), score, untrusted(name, _CHECK_NAME_LIMIT)))
+    scored.sort(key=lambda item: item[0])
+    return [
+        {"name": name, "score": score}
+        for _sort_key, score, name in scored[:_MAX_WEAKEST_CHECKS]
+    ]
+
+
+def _maintained_score_is_zero(checks: Any) -> bool:
+    """Say whether the `Maintained` check (if present) scored exactly 0."""
+    if not isinstance(checks, list):
+        return False
+    for check in checks:
+        if isinstance(check, dict) and check.get("name") == "Maintained":
+            return check.get("score") == 0
+    return False
+
+
+def _scorecard_date(value: Any) -> str | None:
+    """Clip a Scorecard `date` field through `untrusted`, or None."""
+    return untrusted(value, _DATE_LIMIT) if isinstance(value, str) and value else None
+
+
+def _source_repo_from_related(related: Any) -> str | None:
+    """Pick the `SOURCE_REPO` project key from deps.dev `relatedProjects`.
+
+    Returns:
+        The `github.com/{owner}/{repo}` key, validated with
+        `_SOURCE_REPO_RE`, or `None` when there is no such relation or it
+        does not match (for example a non-GitHub forge).
+    """
+    if not isinstance(related, list):
+        return None
+    for item in related:
+        if not isinstance(item, dict) or item.get("relationType") != "SOURCE_REPO":
+            continue
+        key = item.get("projectKey")
+        if not isinstance(key, dict):
+            continue
+        project_id = key.get("id")
+        if isinstance(project_id, str) and _SOURCE_REPO_RE.fullmatch(project_id):
+            return project_id
+    return None
+
+
+def _action_source_repo(name: str) -> str | None:
+    """Derive `github.com/{owner}/{repo}` from a `uses:` action name.
+
+    Only the first two path components are used, so `owner/repo/path`
+    actions resolve to the same repository. Returns `None` when `name`
+    does not start with a well-formed `owner/repo`.
+    """
+    match = _ACTION_NAME_PREFIX_RE.match(name)
+    if match is None:
+        return None
+    candidate = f"github.com/{match.group(1)}/{match.group(2)}"
+    return candidate if _SOURCE_REPO_RE.fullmatch(candidate) else None
+
+
+async def _fetch_version_json(
+    client: httpx.AsyncClient, system: str, name: str, version: str
+) -> Any:
+    """Fetch one deps.dev package-version record.
+
+    Raises:
+        FetchError: Including `http_404` when the name or version is
+            unknown to deps.dev.
+    """
+    url = (
+        f"{DEPSDEV}/systems/{quote(system, safe='')}/packages/"
+        f"{quote(name, safe='')}/versions/{quote(version, safe='')}"
+    )
+    return await fetch_json(client, url, max_bytes=_DEPSDEV_MAX_BYTES)
+
+
+async def _deprecated_direct_deps(
+    client: httpx.AsyncClient, system: str, direct: list[tuple[str, str]]
+) -> list[str]:
+    """Check up to `_MAX_DEP_LOOKUPS` direct dependencies for deprecation.
+
+    Runs `_DEP_LOOKUP_CONCURRENCY` lookups at a time. A failed lookup for
+    one dependency is skipped silently; it never fails the batch.
+
+    Args:
+        direct: `(name, version)` pairs for dependency-graph nodes with
+            relation `DIRECT`.
+
+    Returns:
+        Sorted names whose looked-up version is deprecated.
+    """
+    sample = direct[:_MAX_DEP_LOOKUPS]
+    deprecated: list[str] = []
+    limiter = anyio.CapacityLimiter(_DEP_LOOKUP_CONCURRENCY)
+    lock = anyio.Lock()
+
+    async def check(name: str, version: str) -> None:
+        async with limiter:
+            try:
+                data = await _fetch_version_json(client, system, name, version)
+            except FetchError:
+                return
+            except Exception:  # a bad dependency record must not fail the batch
+                logger.exception("Dependency deprecation check failed for %s", name)
+                return
+        if isinstance(data, dict) and data.get("isDeprecated") is True:
+            async with lock:
+                deprecated.append(name)
+
+    async with anyio.create_task_group() as tg:
+        for name, version in sample:
+            tg.start_soon(check, name, version)
+    return sorted(deprecated)
+
+
+async def _fetch_dependency_summary(
+    client: httpx.AsyncClient, system: str, name: str, version: str
+) -> tuple[dict[str, Any] | None, str]:
+    """Fetch and summarise the dependency graph for one package version.
+
+    Direct dependency counts come from relation `DIRECT`; transitive
+    counts from relation `INDIRECT` only (direct dependencies are not
+    double-counted as transitive). Deprecation is then checked for the
+    direct dependencies (see `_deprecated_direct_deps`).
+
+    Returns:
+        `(summary, status)`. `summary` is
+        `{"direct", "transitive", "deprecated"}`, or `None` on failure.
+        `status` is `"ok"` or `"unavailable: <reason>"`.
+    """
+    url = (
+        f"{DEPSDEV}/systems/{quote(system, safe='')}/packages/"
+        f"{quote(name, safe='')}/versions/{quote(version, safe='')}:dependencies"
+    )
+    try:
+        data = await fetch_json(client, url, max_bytes=_DEPS_MAX_BYTES)
+    except FetchError as exc:
+        return None, f"unavailable: {exc.code}"
+    except Exception:  # a malformed dependency response must not raise
+        logger.exception("Dependency graph lookup failed for %s@%s", name, version)
+        return None, "unavailable: error"
+
+    nodes = data.get("nodes") if isinstance(data, dict) else None
+    direct_pairs: list[tuple[str, str]] = []
+    direct_count = 0
+    transitive_count = 0
+    for node in nodes if isinstance(nodes, list) else []:
+        if not isinstance(node, dict):
+            continue
+        relation = node.get("relation")
+        version_key = node.get("versionKey")
+        dep_name = version_key.get("name") if isinstance(version_key, dict) else None
+        dep_version = (
+            version_key.get("version") if isinstance(version_key, dict) else None
+        )
+        if relation == "DIRECT":
+            direct_count += 1
+            if isinstance(dep_name, str) and isinstance(dep_version, str):
+                direct_pairs.append((dep_name, dep_version))
+        elif relation == "INDIRECT":
+            transitive_count += 1
+
+    deprecated_names = await _deprecated_direct_deps(client, system, direct_pairs)
+    summary = {
+        "direct": direct_count,
+        "transitive": transitive_count,
+        "deprecated": deprecated_names,
+    }
+    return summary, "ok"
+
+
+def _scorecard_from_checks(
+    score: Any, date: Any, checks: Any
+) -> tuple[dict[str, Any] | None, bool]:
+    """Build the `scorecard` summary dict plus the `Maintained`-is-zero flag."""
+    if isinstance(score, bool) or not isinstance(score, int | float):
+        return None, False
+    scorecard = {
+        "score": score,
+        "date": _scorecard_date(date),
+        "weakest": _weakest_checks(checks),
+    }
+    return scorecard, _maintained_score_is_zero(checks)
+
+
+async def _fetch_deps_dev_scorecard(
+    client: httpx.AsyncClient, source_repo: str
+) -> tuple[dict[str, Any] | None, str, bool]:
+    """Fetch the Scorecard embedded in deps.dev's project info.
+
+    Returns:
+        `(scorecard, status, maintained_is_zero)`.
+    """
+    url = f"{DEPSDEV}/projects/{quote(source_repo, safe='')}"
+    try:
+        data = await fetch_json(client, url, max_bytes=_DEPSDEV_MAX_BYTES)
+    except FetchError as exc:
+        if exc.code == "http_404":
+            return None, "not_found", False
+        return None, f"unavailable: {exc.code}", False
+    except Exception:  # a malformed project response must not raise
+        logger.exception("deps.dev project lookup failed for %s", source_repo)
+        return None, "unavailable: error", False
+    sc = data.get("scorecard") if isinstance(data, dict) else None
+    if not isinstance(sc, dict):
+        return None, "ok", False
+    scorecard, maintained_zero = _scorecard_from_checks(
+        sc.get("overallScore"), sc.get("date"), sc.get("checks")
+    )
+    return scorecard, "ok", maintained_zero
+
+
+async def _fetch_scorecard_api(
+    client: httpx.AsyncClient, source_repo: str
+) -> tuple[dict[str, Any] | None, str, bool]:
+    """Fetch a project's Scorecard directly from api.securityscorecards.dev.
+
+    Returns:
+        `(scorecard, status, maintained_is_zero)`.
+    """
+    quoted = "/".join(quote(part, safe="") for part in source_repo.split("/"))
+    url = f"{SCORECARD}/{quoted}"
+    try:
+        data = await fetch_json(client, url, max_bytes=_SCORECARD_MAX_BYTES)
+    except FetchError as exc:
+        if exc.code == "http_404":
+            return None, "not_found", False
+        return None, f"unavailable: {exc.code}", False
+    except Exception:  # a malformed Scorecard response must not raise
+        logger.exception("Scorecard lookup failed for %s", source_repo)
+        return None, "unavailable: error", False
+    if not isinstance(data, dict):
+        return None, "ok", False
+    scorecard, maintained_zero = _scorecard_from_checks(
+        data.get("score"), data.get("date"), data.get("checks")
+    )
+    return scorecard, "ok", maintained_zero
+
+
+def _adoption_notes(
+    *,
+    deprecated: bool | None,
+    provenance: bool | None,
+    scorecard: dict[str, Any] | None,
+    maintained_zero: bool,
+    license_class: str,
+    dependencies: dict[str, Any] | None,
+) -> list[str]:
+    """Flag concerns worth raising with whoever adopts the package.
+
+    Each string is exact and stable, meant to be matched on by callers,
+    not prose: `"deprecated"`, `"no provenance or attestation"`,
+    `"Scorecard below 4"`, `"Maintained check scores 0"`,
+    `"copyleft licence: raise with the user"`, `"licence unknown"`,
+    `"more than 100 transitive dependencies"`, `"has deprecated
+    dependencies"`.
+    """
+    notes: list[str] = []
+    if deprecated:
+        notes.append("deprecated")
+    if provenance is False:
+        notes.append("no provenance or attestation")
+    if scorecard is not None:
+        score = scorecard.get("score")
+        if isinstance(score, int | float) and score < 4:
+            notes.append("Scorecard below 4")
+    if maintained_zero:
+        notes.append("Maintained check scores 0")
+    if license_class == "copyleft":
+        notes.append("copyleft licence: raise with the user")
+    elif license_class == "unknown":
+        notes.append("licence unknown")
+    if dependencies is not None:
+        if (dependencies.get("transitive") or 0) > _TRANSITIVE_DEPENDENCY_LIMIT:
+            notes.append("more than 100 transitive dependencies")
+        if dependencies.get("deprecated"):
+            notes.append("has deprecated dependencies")
+    return notes
+
+
+def _unsupported_assessment(
+    name: str, version: str, ecosystem: str
+) -> PackageAssessment:
+    """An assessment for an ecosystem assess_package does not support."""
+    return PackageAssessment(
+        name=name,
+        version=version,
+        ecosystem=ecosystem,
+        exists=False,
+        deprecated=None,
+        deprecated_reason=None,
+        licenses=[],
+        license_class="unknown",
+        advisories=[],
+        provenance=None,
+        source_repo=None,
+        scorecard=None,
+        dependencies=None,
+        adoption_notes=[],
+        sources={"deps_dev": "unsupported_ecosystem"},
+    )
+
+
+async def _assess_action(
+    client: httpx.AsyncClient, name: str, version: str, raw_ecosystem: str
+) -> PackageAssessment:
+    """Assess a GitHub Action: Scorecard only, deps.dev is never queried."""
+    source_repo = _action_source_repo(name)
+    sources: dict[str, str] = {}
+    scorecard: dict[str, Any] | None = None
+    maintained_zero = False
+    if source_repo is None:
+        sources["scorecard"] = "invalid_name"
+    else:
+        scorecard, sources["scorecard"], maintained_zero = await _fetch_scorecard_api(
+            client, source_repo
+        )
+
+    adoption_notes = _adoption_notes(
+        deprecated=None,
+        provenance=None,
+        scorecard=scorecard,
+        maintained_zero=maintained_zero,
+        license_class="unknown",
+        dependencies=None,
+    )
+    return PackageAssessment(
+        name=name,
+        version=version,
+        ecosystem=raw_ecosystem,
+        exists=source_repo is not None,
+        deprecated=None,
+        deprecated_reason=None,
+        licenses=[],
+        license_class="unknown",
+        advisories=[],
+        provenance=None,
+        source_repo=source_repo,
+        scorecard=scorecard,
+        dependencies=None,
+        adoption_notes=adoption_notes,
+        sources=sources,
+    )
+
+
+async def _assess_registry_package(
+    client: httpx.AsyncClient, name: str, version: str, raw_ecosystem: str, system: str
+) -> PackageAssessment:
+    """Assess a pypi/npm package: deps.dev, its project Scorecard, and deps."""
+    sources: dict[str, str] = {}
+    exists = False
+    deprecated: bool | None = None
+    deprecated_reason: str | None = None
+    licenses: list[str] = []
+    advisories: list[str] = []
+    provenance: bool | None = None
+    source_repo: str | None = None
+
+    data: Any = None
+    try:
+        data = await _fetch_version_json(client, system, name, version)
+    except FetchError as exc:
+        sources["deps_dev"] = (
+            "not_found" if exc.code == "http_404" else f"unavailable: {exc.code}"
+        )
+    except Exception:  # a malformed deps.dev response must not fail the call
+        logger.exception("deps.dev lookup failed for %s@%s", name, version)
+        sources["deps_dev"] = "unavailable: error"
+    else:
+        sources["deps_dev"] = "ok"
+
+    if isinstance(data, dict):
+        exists = True
+        deprecated = bool(data.get("isDeprecated", False))
+        reason = data.get("deprecatedReason")
+        if isinstance(reason, str) and reason:
+            deprecated_reason = untrusted(reason, _REASON_TEXT_LIMIT)
+        raw_licenses = data.get("licenses")
+        if isinstance(raw_licenses, list):
+            licenses = [
+                untrusted(lic, _LICENSE_TEXT_LIMIT)
+                for lic in raw_licenses
+                if isinstance(lic, str)
+            ][:_MAX_LICENSES]
+        raw_advisories = data.get("advisoryKeys")
+        if isinstance(raw_advisories, list):
+            advisories = [
+                untrusted(item["id"], _ADVISORY_ID_LIMIT)
+                for item in raw_advisories
+                if isinstance(item, dict) and isinstance(item.get("id"), str)
+            ][:_MAX_ADVISORIES]
+        provenance = bool(data.get("slsaProvenances")) or bool(data.get("attestations"))
+        source_repo = _source_repo_from_related(data.get("relatedProjects"))
+
+    license_class = _license_class(licenses)
+
+    scorecard: dict[str, Any] | None = None
+    maintained_zero = False
+    if source_repo is not None:
+        scorecard, scorecard_status, maintained_zero = await _fetch_deps_dev_scorecard(
+            client, source_repo
+        )
+        sources["scorecard"] = scorecard_status
+
+    dependencies: dict[str, Any] | None = None
+    if exists:
+        dependencies, sources["dependencies"] = await _fetch_dependency_summary(
+            client, system, name, version
+        )
+
+    adoption_notes = _adoption_notes(
+        deprecated=deprecated,
+        provenance=provenance,
+        scorecard=scorecard,
+        maintained_zero=maintained_zero,
+        license_class=license_class,
+        dependencies=dependencies,
+    )
+
+    return PackageAssessment(
+        name=name,
+        version=version,
+        ecosystem=raw_ecosystem,
+        exists=exists,
+        deprecated=deprecated,
+        deprecated_reason=deprecated_reason,
+        licenses=licenses,
+        license_class=license_class,
+        advisories=advisories,
+        provenance=provenance,
+        source_repo=source_repo,
+        scorecard=scorecard,
+        dependencies=dependencies,
+        adoption_notes=adoption_notes,
+        sources=sources,
+    )
+
+
+async def assess_package(
+    client: httpx.AsyncClient, name: str, version: str, ecosystem: str
+) -> PackageAssessment:
+    """Assess one package against deps.dev and the OpenSSF Scorecard.
+
+    This is pre-adoption signal, not an existence check (use
+    `sca_verify_packages` for that) and not a verdict: it gathers license,
+    provenance, maintenance, and dependency-shape signals for a human or
+    agent to weigh. Every source is independent and best effort: a
+    failure sets its `sources` entry and leaves the fields it would have
+    filled `None` or empty, but this never raises.
+
+    Args:
+        client: Client from `new_client`.
+        name: Package name, or `owner/repo[/path]` for `github-actions`.
+        version: Version string, or the action's ref for `github-actions`.
+        ecosystem: `"pypi"` or `"npm"` (or an alias of either), or
+            `"github-actions"`. Any other value, including `"container"`,
+            is unsupported: the result notes `sources["deps_dev"] ==
+            "unsupported_ecosystem"` rather than this raising.
+
+    Returns:
+        A `PackageAssessment`.
+    """
+    eco = _normalize_assess_ecosystem(ecosystem)
+    if eco is None:
+        return _unsupported_assessment(name, version, ecosystem)
+    if eco == "github-actions":
+        return await _assess_action(client, name, version, ecosystem)
+    return await _assess_registry_package(client, name, version, ecosystem, eco)
