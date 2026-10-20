@@ -22,13 +22,16 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 from urllib.parse import urlencode
 
 import anyio
 import httpx
 
 from mcp_security_review.guard.clip import clip
+
+if TYPE_CHECKING:
+    from mcp_security_review.providers.attack import AttackIndex
 
 logger = logging.getLogger(__name__)
 
@@ -938,9 +941,9 @@ class ExploitContext:
             EPSS could not be checked or had no score for any of them.
         epss_percentile: The percentile for `epss`, or `None`.
         attack_techniques: MITRE ATT&CK techniques linked to this
-            vulnerability via the CTID KEV mapping, as `{"id": <technique
-            id>}` (no `name` yet; a later task adds one from an ATT&CK name
-            index). Empty when CTID has no mapping for any of `cves`, or
+            vulnerability via the CTID KEV mapping, as `{"id", "name"}`
+            when the cached ATT&CK index names the technique, else just
+            `{"id"}`. Empty when CTID has no mapping for any of `cves`, or
             when CTID could not be checked.
         priority: `"upgrade_now"`, `"check_reachability"`, or `"unknown"`
             (no CVE ids to look up).
@@ -948,7 +951,10 @@ class ExploitContext:
             `{"kev": "unavailable: timeout"}`. A source that succeeded is
             absent from this mapping, except `"ctid"`, which is always
             present when `cves` is non-empty: `"ok (snapshot <snapshot>)"`
-            on success, `"unavailable: <code>"` on failure.
+            on success, `"unavailable: <code>"` on failure. When CTID
+            succeeded, `"attack"` says whether technique names came from
+            the ATT&CK index (`"ok (ATT&CK <version>)"`), are pending while
+            it downloads, or are `"unavailable: error"`.
     """
 
     cves: list[str]
@@ -976,6 +982,38 @@ class ExploitContext:
         }
 
 
+def _load_attack_index(cache: IntelCache) -> tuple["AttackIndex | None", str]:
+    """Read the cached ATT&CK index for naming techniques, never raising.
+
+    Returns:
+        `(index, status)`. The index is None when none is cached (status is
+        the pending status) or reading failed (`"unavailable: error"`);
+        otherwise the status is `"ok (ATT&CK <version>)"`.
+    """
+    try:
+        # Imported lazily: attack.py imports from this module.
+        from mcp_security_review.providers.attack import AttackIndex, attack_summary
+
+        index = AttackIndex.load(cache)
+        _, status = attack_summary([], index)
+        return index, status
+    except Exception:  # defensive: exploit context must never raise
+        logger.exception("ATT&CK index lookup failed")
+        return None, "unavailable: error"
+
+
+def _named_techniques(
+    tids: list[str], index: "AttackIndex | None"
+) -> list[dict[str, str]]:
+    """Turn technique ids into `{"id", "name"}`, or `{"id"}` when unnamed."""
+    out: list[dict[str, str]] = []
+    for tid in tids:
+        tech = index.technique(tid) if index is not None else None
+        name = tech.get("name") if tech is not None else None
+        out.append({"id": tid, "name": name} if isinstance(name, str) else {"id": tid})
+    return out
+
+
 async def build_exploit_contexts(
     vulns: list[_CveBearing],
     *,
@@ -993,7 +1031,8 @@ async def build_exploit_contexts(
     `sources["kev"]`/`sources["epss"]`/`sources["ctid"]`
     (`"unavailable: <code>"`) and the corresponding fields are left `None`
     or empty, but the function still returns a context for every
-    vulnerability passed in.
+    vulnerability passed in. Technique names come from the cached ATT&CK
+    index; without one the techniques keep their ids only.
 
     Args:
         vulns: Vulnerabilities to build context for. Only `.id` and
@@ -1051,6 +1090,7 @@ async def build_exploit_contexts(
                 logger.exception("CTID lookup failed")
                 ctid_unavailable = "unavailable: error"
 
+        attack_state: tuple[AttackIndex | None, str] | None = None
         contexts: dict[str, ExploitContext] = {}
         for vuln in vulns:
             cves = vuln.cve_ids()
@@ -1100,7 +1140,12 @@ async def build_exploit_contexts(
                 technique_ids: set[str] = set()
                 for cve in cves:
                     technique_ids.update(ctid_mapping.by_cve.get(cve, []))
-                attack_techniques = [{"id": tid} for tid in sorted(technique_ids)]
+                if attack_state is None:
+                    attack_state = _load_attack_index(active_cache)
+                attack_index, sources["attack"] = attack_state
+                attack_techniques = _named_techniques(
+                    sorted(technique_ids), attack_index
+                )
 
             contexts[vuln.id] = ExploitContext(
                 cves=cves,

@@ -19,6 +19,7 @@ from mcp_security_review.library import (
 from mcp_security_review.security import CodeReviewContextBuilder
 from mcp_security_review.servers.library_support import (
     library_error,
+    load_attack_index,
     split_ids,
     unknown_component_error,
 )
@@ -104,7 +105,9 @@ async def lightweight_security_review(
     Returns:
         JSON. Without components: status "needs_components" and the menu. With
         components: status "complete" with the risk level, threats (most severe
-        first), and the countermeasures that mitigate them.
+        first) with their MITRE ATT&CK techniques, and the countermeasures that
+        mitigate them. `assessment.sources.attack` says whether technique
+        names are available or still downloading (ids only).
 
     Example:
         lightweight_security_review("Add avatar upload")
@@ -145,7 +148,7 @@ async def lightweight_security_review(
     except UnknownComponentError as e:
         return unknown_component_error(e, {"task_description": task_description})
 
-    view = describe(result, MAX_ALSO_CONSIDER)
+    view = describe(result, MAX_ALSO_CONSIDER, attack=load_attack_index())
     broad_hint = (
         f"You picked {len(result.picked)} components. Most changes involve 2 to 5; "
         "pick only what this change adds or modifies for a shorter, more relevant "
@@ -266,7 +269,8 @@ async def verify_code_security(
         JSON containing:
         - review_prompt: Instructions for performing the security review
         - security_checklist: Items to verify in the code
-        - focus_areas: Specific vulnerability types to look for
+        - focus_areas: Specific vulnerability types to look for, each with its
+          MITRE ATT&CK technique when known
         - context: file path, components, and risk level
 
     After receiving this response, review your code and provide:
@@ -285,12 +289,14 @@ async def verify_code_security(
     except LibraryError as e:
         return library_error(e, {})
 
+    picked = split_ids(components)
     try:
         context_builder = CodeReviewContextBuilder(library)
         review_context = context_builder.build_review_context(
             file_path=file_path if file_path else None,
-            components=split_ids(components) or None,
+            components=picked or None,
             data_handled=split_ids(data_handled) or None,
+            attack=load_attack_index() if picked else None,
         )
     except UnknownComponentError as e:
         return unknown_component_error(e, {})

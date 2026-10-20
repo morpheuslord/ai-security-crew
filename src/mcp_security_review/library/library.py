@@ -3,6 +3,8 @@
 from dataclasses import dataclass, field
 from typing import Any
 
+from mcp_security_review.providers.attack import AttackIndex, attack_summary
+
 from .models import SEVERITY_RANK, Component, Countermeasure, Severity, Threat
 
 SENSITIVE_DATA_TYPES = (
@@ -165,8 +167,25 @@ def summarize(resolution: Resolution) -> dict[str, Any]:
     }
 
 
-def describe(resolution: Resolution, max_also_consider: int = 8) -> dict[str, Any]:
-    """Return the compact, JSON-ready view of a resolution used by the tools."""
+def describe(
+    resolution: Resolution,
+    max_also_consider: int = 8,
+    attack: AttackIndex | None = None,
+) -> dict[str, Any]:
+    """Return the compact, JSON-ready view of a resolution used by the tools.
+
+    Args:
+        resolution: The resolved components, threats, and countermeasures.
+        max_also_consider: Most lesser-priority threats to list.
+        attack: A loaded ATT&CK index, or None while it downloads. Threats
+            with ATT&CK ids get an `attack` list; with an index each item
+            carries the technique name and tactics, without one only the id.
+
+    Returns:
+        The view. `sources["attack"]` says whether technique names were
+        available (`"ok (ATT&CK <version>)"`) or are still pending.
+    """
+    _, attack_status = attack_summary([], attack)
     return {
         "risk_level": resolution.risk_level.value,
         "components": resolution.picked,
@@ -174,7 +193,7 @@ def describe(resolution: Resolution, max_also_consider: int = 8) -> dict[str, An
             c for c in resolution.components if c not in resolution.picked
         ],
         "sensitive_data": resolution.sensitive_data,
-        "threats": [_threat_view(t) for t in resolution.threats],
+        "threats": [_threat_view(t, attack) for t in resolution.threats],
         "countermeasures": [
             {
                 "id": m.id,
@@ -190,11 +209,15 @@ def describe(resolution: Resolution, max_also_consider: int = 8) -> dict[str, An
             {"id": t.id, "name": t.name, "severity": t.severity.value}
             for t in resolution.also_consider[:max_also_consider]
         ],
+        "sources": {"attack": attack_status},
     }
 
 
-def _threat_view(threat: Threat) -> dict[str, Any]:
-    """Compact view of one threat; the MCP Top 10 ids appear only when present."""
+def _threat_view(threat: Threat, attack: AttackIndex | None) -> dict[str, Any]:
+    """Compact view of one threat.
+
+    The MCP Top 10 and ATT&CK fields appear only when the threat has them.
+    """
     view: dict[str, Any] = {
         "id": threat.id,
         "name": threat.name,
@@ -203,4 +226,6 @@ def _threat_view(threat: Threat) -> dict[str, Any]:
     }
     if threat.mcp_top10:
         view["mcp_top10"] = threat.mcp_top10
+    if threat.attack:
+        view["attack"], _ = attack_summary(threat.attack, attack)
     return view

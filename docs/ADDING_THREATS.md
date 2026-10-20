@@ -38,6 +38,7 @@ threats:
     stride: [spoofing]                  # optional
     cwe: [CWE-345]                      # optional, format CWE-<number>
     mcp_top10: ["MCP06:2025"]           # optional, OWASP MCP Top 10 2025 id
+    attack: [T1550.001]                 # optional, MITRE ATT&CK technique ids
     countermeasures: [check-sso-audience, validate-token-claims]
 
 countermeasures:
@@ -61,11 +62,18 @@ disable: [open-redirect]                # optional: hide built-in entries by id
 - Every reference must exist. Unknown fields, bad severities, and malformed CWE or ASVS
   ids are reported together, and the tool returns that list instead of a review.
 - A countermeasure with `baseline: true` is added to every code review checklist.
+- `attack` lists MITRE ATT&CK Enterprise technique ids only (`T1190`, `T1078.004`),
+  never names or descriptions. Use current ids: not revoked or deprecated in the
+  latest ATT&CK release (check the technique page on attack.mitre.org, or look the
+  id up with the `threatmodel_attack_technique` tool). Reviews add the technique
+  name and tactics from the ATT&CK catalogue the server downloads; until it has
+  downloaded, they show the ids only. Leave `attack` out when no technique fits.
 - The risk level of a review is the highest severity among the threats on the components
   the agent picked. Sensitive data (`data_handled`) raises it one step.
 
 ## Checking your files
 
 Ask your agent for a review. If a file is invalid, the tool returns every problem found.
-For the built-in library, `tests/unit/library/` checks references, uniqueness, and that
-every cited ASVS id exists in ASVS 5.0.0.
+For the built-in library, `tests/unit/library/` checks references, uniqueness, that
+every cited ASVS id exists in ASVS 5.0.0, and that every ATT&CK id exists and is
+current.

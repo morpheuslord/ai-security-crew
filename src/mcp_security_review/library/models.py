@@ -11,6 +11,8 @@ Slug = Annotated[str, StringConstraints(pattern=SLUG)]
 CweId = Annotated[str, StringConstraints(pattern=r"^CWE-[1-9][0-9]*$")]
 AsvsId = Annotated[str, StringConstraints(pattern=r"^v5\.0\.0-[0-9]+\.[0-9]+\.[0-9]+$")]
 McpTop10Id = Annotated[str, StringConstraints(pattern=r"^MCP(0[1-9]|10):2025$")]
+# A MITRE ATT&CK Enterprise technique or sub-technique id, such as T1190.
+AttackId = Annotated[str, StringConstraints(pattern=r"^T[0-9]{4}(\.[0-9]{3})?$")]
 
 
 class Severity(str, Enum):
@@ -75,6 +77,7 @@ class Threat(_Entry):
     stride: list[Stride] = Field(default_factory=list)
     cwe: list[CweId] = Field(default_factory=list)
     mcp_top10: list[McpTop10Id] = Field(default_factory=list)
+    attack: list[AttackId] = Field(default_factory=list)
     countermeasures: list[Slug]
 
 

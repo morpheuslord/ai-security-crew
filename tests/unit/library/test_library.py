@@ -1,15 +1,28 @@
 """Tests for the built-in threat library and the component lookup."""
 
 from pathlib import Path
+from typing import Any
 
 import pytest
+from pydantic import ValidationError
 
 from mcp_security_review.library import (
     Severity,
     UnknownComponentError,
+    describe,
     load_library,
 )
 from mcp_security_review.library.library import Library
+from mcp_security_review.library.models import Threat
+from mcp_security_review.providers.attack import (
+    PENDING_STATUS,
+    AttackIndex,
+    build_index,
+)
+
+ATTACK_FIXTURE = (
+    Path(__file__).parents[2] / "fixtures" / "attack-enterprise-subset.json"
+)
 
 ASVS_IDS = {
     line.strip()
@@ -180,3 +193,76 @@ def test_baseline_countermeasures_are_flagged(library: Library) -> None:
         "log-without-secrets",
         "generic-error-messages",
     }
+
+
+# ---- ATT&CK ----
+
+
+@pytest.fixture(scope="module")
+def attack_index() -> AttackIndex:
+    return AttackIndex.from_dict(build_index(ATTACK_FIXTURE))
+
+
+def test_every_attack_id_exists_and_is_current(
+    library: Library, attack_index: AttackIndex
+) -> None:
+    for threat in library.threats.values():
+        for tid in threat.attack:
+            tech = attack_index.technique(tid)
+            assert tech is not None, (threat.id, tid)
+            assert not tech["revoked"], (threat.id, tid)
+            assert not tech["deprecated"], (threat.id, tid)
+
+
+def test_majority_of_threats_have_attack_ids(library: Library) -> None:
+    mapped = sum(bool(t.attack) for t in library.threats.values())
+    assert mapped >= 0.6 * len(library.threats)
+
+
+def test_attack_ids_follow_the_library_mapping(library: Library) -> None:
+    threats = library.threats
+    assert "T1190" in threats["sql-injection"].attack
+    assert threats["credential-stuffing"].attack == ["T1110.004"]
+    assert "T1552.005" in threats["ssrf"].attack
+    assert threats["public-bucket"].attack == ["T1530"]
+    assert "T1195.001" in threats["typosquatted-package"].attack
+
+
+def test_threat_rejects_malformed_attack_ids() -> None:
+    base: dict[str, Any] = {
+        "id": "x",
+        "name": "x",
+        "components": ["database"],
+        "severity": "high",
+        "countermeasures": ["parameterized-queries"],
+    }
+    assert Threat(**base, attack=["T1190", "T1078.004"]).attack == [
+        "T1190",
+        "T1078.004",
+    ]
+    for bad in ("t1190", "T190", "T1190.4", "TA0001", "T1190 "):
+        with pytest.raises(ValidationError):
+            Threat(**base, attack=[bad])
+
+
+def test_describe_names_attack_techniques_with_an_index(
+    library: Library, attack_index: AttackIndex
+) -> None:
+    view = describe(library.resolve(["database"]), attack=attack_index)
+
+    sqli = next(t for t in view["threats"] if t["id"] == "sql-injection")
+    assert sqli["attack"][0]["id"] == "T1190"
+    assert sqli["attack"][0]["name"] == "Exploit Public-Facing Application"
+    assert sqli["attack"][0]["tactics"] == ["initial-access"]
+    assert view["sources"] == {"attack": "ok (ATT&CK 20.0)"}
+
+
+def test_describe_without_an_index_gives_ids_and_pending(library: Library) -> None:
+    view = describe(library.resolve(["database"]), 8)
+
+    sqli = next(t for t in view["threats"] if t["id"] == "sql-injection")
+    assert sqli["attack"] == [{"id": "T1190"}]
+    assert view["sources"] == {"attack": PENDING_STATUS}
+    # Threats without an ATT&CK mapping carry no attack field.
+    unmapped = [t for t in view["threats"] if not library.threats[t["id"]].attack]
+    assert all("attack" not in t for t in unmapped)

@@ -1,13 +1,26 @@
 """Tests for verify_code_security and perform_threat_model with the library."""
 
 import json
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 import pytest
 from fastmcp import Client
 
+from mcp_security_review.providers.attack import (
+    ATTACK_INDEX_KEY,
+    PENDING_STATUS,
+    AttackIndex,
+    build_index,
+)
+from mcp_security_review.providers.intel import IntelCache
+from mcp_security_review.servers import library_support
 from mcp_security_review.servers.main import main_mcp
+
+ATTACK_FIXTURE = (
+    Path(__file__).parents[2] / "fixtures" / "attack-enterprise-subset.json"
+)
 
 
 async def call(tool: str, **args: Any) -> dict[str, Any]:
@@ -19,6 +32,31 @@ async def call(tool: str, **args: Any) -> dict[str, Any]:
 
 VERIFY = "general_verify_code_security"
 THREAT = "threatmodel_perform_threat_model"
+ATTACK = "threatmodel_attack_technique"
+
+
+@pytest.fixture(scope="module")
+def attack_data() -> dict[str, Any]:
+    return build_index(ATTACK_FIXTURE)
+
+
+@pytest.fixture
+def cached_attack(attack_data: dict[str, Any]) -> None:
+    """Put the fixture ATT&CK index in the (per-test) intel cache."""
+    IntelCache().put(ATTACK_INDEX_KEY, attack_data)
+
+
+@pytest.fixture
+def refresh_calls(monkeypatch: pytest.MonkeyPatch) -> list[object]:
+    """Record background ATT&CK refreshes the tools ask for."""
+    calls: list[object] = []
+
+    def fake(cache: object = None) -> bool:
+        calls.append(cache)
+        return True
+
+    monkeypatch.setattr(library_support, "ensure_attack_index_background", fake)
+    return calls
 
 
 @pytest.mark.anyio
@@ -137,3 +175,174 @@ async def test_threat_model_keeps_previous_models_as_reference() -> None:
     )
 
     assert [m["title"] for m in data["previous_threat_models"]] == ["Auth v1"]
+
+
+# ---- ATT&CK in reviews ----
+
+
+@pytest.mark.anyio
+@pytest.mark.usefixtures("cached_attack")
+async def test_verify_focus_areas_name_attack_techniques() -> None:
+    data = await call(VERIFY, components="database")
+
+    assert (
+        "Attacker input changes the meaning of a database query "
+        "(ATT&CK T1190 Exploit Public-Facing Application)"
+    ) in data["focus_areas"]
+    assert "(ATT&CK T1190 Exploit Public-Facing Application)" in data["review_prompt"]
+
+
+@pytest.mark.anyio
+async def test_verify_focus_areas_are_plain_without_an_index(
+    refresh_calls: list[object],
+) -> None:
+    data = await call(VERIFY, components="database")
+
+    assert (
+        "Attacker input changes the meaning of a database query" in data["focus_areas"]
+    )
+    assert not any("ATT&CK" in area for area in data["focus_areas"])
+    assert len(refresh_calls) == 1
+
+
+@pytest.mark.anyio
+@pytest.mark.usefixtures("cached_attack")
+async def test_threat_model_known_threats_carry_attack_names() -> None:
+    data = await call(
+        THREAT, title="Avatar upload", description="Upload", components="file-upload"
+    )
+
+    known = data["known_threats"]
+    upload = next(t for t in known["threats"] if t["id"] == "upload-executable-file")
+    names = {a["id"]: a.get("name") for a in upload["attack"]}
+    assert names["T1505.003"] == "Web Shell"
+    assert known["sources"] == {"attack": "ok (ATT&CK 20.0)"}
+
+
+@pytest.mark.anyio
+async def test_threat_model_without_index_is_pending(
+    refresh_calls: list[object],
+) -> None:
+    data = await call(
+        THREAT, title="Avatar upload", description="Upload", components="file-upload"
+    )
+
+    known = data["known_threats"]
+    upload = next(t for t in known["threats"] if t["id"] == "upload-executable-file")
+    assert {"id": "T1505.003"} in upload["attack"]
+    assert known["sources"] == {"attack": PENDING_STATUS}
+    assert len(refresh_calls) == 1
+
+
+# ---- threatmodel_attack_technique ----
+
+
+@pytest.mark.anyio
+@pytest.mark.usefixtures("cached_attack")
+async def test_attack_tool_by_id() -> None:
+    data = await call(ATTACK, technique_id="t1190")
+
+    assert data["success"] is True
+    assert data["attack_version"] == "20.0"
+    tech = data["technique"]
+    assert tech["id"] == "T1190"
+    assert tech["name"] == "Exploit Public-Facing Application"
+    assert tech["url"] == "https://attack.mitre.org/techniques/T1190"
+    assert tech["mitigations"]
+    assert "warning" not in data
+
+
+@pytest.mark.anyio
+@pytest.mark.usefixtures("cached_attack")
+async def test_attack_tool_by_query() -> None:
+    data = await call(ATTACK, query="credential stuffing")
+
+    assert data["success"] is True
+    assert data["attack_version"] == "20.0"
+    assert data["matches"][0]["id"] == "T1110.004"
+    assert data["matches"][0]["name"] == "Credential Stuffing"
+    assert len(data["matches"]) <= 10
+
+
+@pytest.mark.anyio
+@pytest.mark.usefixtures("cached_attack")
+async def test_attack_tool_revoked_warning() -> None:
+    data = await call(ATTACK, technique_id="T1081")
+
+    assert data["success"] is True
+    assert data["technique"]["revoked"] is True
+    assert data["warning"] == "Revoked in ATT&CK; use T1552.001"
+
+
+@pytest.mark.anyio
+@pytest.mark.usefixtures("cached_attack")
+async def test_attack_tool_unknown_id() -> None:
+    data = await call(ATTACK, technique_id="T9999")
+
+    assert data["success"] is False
+    assert data["error"]["code"] == "technique_not_found"
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("bad", ["T19", "TA0001", "T1190.4", "1190", "T1190; rm"])
+async def test_attack_tool_invalid_id(bad: str, refresh_calls: list[object]) -> None:
+    data = await call(ATTACK, technique_id=bad)
+
+    assert data["success"] is False
+    assert data["error"]["code"] == "invalid_technique_id"
+    assert refresh_calls == []
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "args",
+    [
+        {"technique_id": "T1190", "query": "phishing"},
+        {},
+        {"technique_id": "  ", "query": ""},
+        {"query": "x"},
+        {"query": "x" * 101},
+    ],
+)
+async def test_attack_tool_rejects_bad_arguments(args: dict[str, str]) -> None:
+    data = await call(ATTACK, **args)
+
+    assert data["success"] is False
+    assert data["error"]["code"] == "invalid_arguments"
+    assert data["error"]["hint"]
+
+
+@pytest.mark.anyio
+async def test_attack_tool_pending_starts_a_refresh(
+    refresh_calls: list[object],
+) -> None:
+    data = await call(ATTACK, technique_id="T1190")
+
+    assert data["success"] is False
+    assert data["error"]["code"] == "attack_data_pending"
+    assert data["error"]["hint"] == "Retry in a minute; the catalogue is downloading."
+    assert len(refresh_calls) == 1
+
+
+@pytest.mark.anyio
+async def test_attack_tool_answers_from_a_stale_index_and_refreshes(
+    attack_data: dict[str, Any],
+    refresh_calls: list[object],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stale = AttackIndex.from_dict(attack_data)
+    stale.fetched_at = datetime.now(UTC) - timedelta(days=30)
+    monkeypatch.setattr(
+        library_support.AttackIndex, "load", classmethod(lambda cls, cache=None: stale)
+    )
+
+    data = await call(ATTACK, technique_id="T1190")
+
+    assert data["success"] is True
+    assert len(refresh_calls) == 1
+
+
+@pytest.mark.anyio
+async def test_attack_tool_is_read_only() -> None:
+    tools = await main_mcp.get_tools()
+    assert "write" not in tools[ATTACK].tags

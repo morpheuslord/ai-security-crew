@@ -21,13 +21,11 @@ import tempfile
 import threading
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import anyio
 import anyio.to_thread
 import httpx
-from mitreattack.stix20 import MitreAttackData
-from stix2.exceptions import STIXError
 
 from mcp_security_review.providers.intel import (
     FetchError,
@@ -36,6 +34,13 @@ from mcp_security_review.providers.intel import (
     new_client,
     untrusted,
 )
+
+if TYPE_CHECKING:
+    from mitreattack.stix20 import MitreAttackData
+
+# `mitreattack` and `stix2` take seconds to import, so they are imported only
+# where a bundle is parsed; reading the built index must stay cheap because
+# every review tool does it.
 
 logger = logging.getLogger(__name__)
 
@@ -124,7 +129,7 @@ def _named_refs(
     return items[:limit]
 
 
-def _detections_by_technique(data: MitreAttackData) -> dict[str, list[str]]:
+def _detections_by_technique(data: "MitreAttackData") -> dict[str, list[str]]:
     """Map technique STIX id to the names of data components that detect it.
 
     ATT&CK before v18 links data components to techniques directly with
@@ -161,7 +166,7 @@ def _detections_by_technique(data: MitreAttackData) -> dict[str, list[str]]:
     }
 
 
-def _bundle_version(data: MitreAttackData) -> str:
+def _bundle_version(data: "MitreAttackData") -> str:
     """Read the ATT&CK release from the bundle's collection object."""
     for collection in data.get_objects_by_type("x-mitre-collection"):
         version = collection.get("x_mitre_version")
@@ -191,6 +196,8 @@ def build_index(stix_path: Path) -> dict[str, Any]:
         STIXError: The bundle is not valid STIX.
         OSError: The file cannot be read.
     """
+    from mitreattack.stix20 import MitreAttackData  # slow import, see top
+
     data = MitreAttackData(stix_filepath=str(stix_path))
     techniques = data.get_techniques(remove_revoked_deprecated=False)
     groups = data.get_all_groups_using_all_techniques()
@@ -485,6 +492,8 @@ async def refresh_attack_index(
             bundle could not be parsed (`invalid_stix`), or the temp file
             could not be written (`cache_error`).
     """
+    from stix2.exceptions import STIXError  # slow import, see top
+
     resp = await fetch_bytes(
         client,
         ATTACK_STIX_URL,

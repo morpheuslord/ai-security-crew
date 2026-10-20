@@ -126,6 +126,7 @@ AGENT_INSTRUCTIONS = (
     "## 4. Persisting threat models (optional)\n"
     "After `threatmodel_perform_threat_model`, call `threatmodel_update_threat_model_file` to write `threat-model.md`.\n"  # noqa: E501
     "If earlier threat models or design pages exist in a wiki or docs tool you have connected, fetch them first and pass them as `previous_models_json` to avoid duplicating work.\n"  # noqa: E501
+    "Explain an ATT&CK id from a review or scan with `threatmodel_attack_technique`.\n"  # noqa: E501
 )
 
 main_mcp = SecurityReviewMCP(

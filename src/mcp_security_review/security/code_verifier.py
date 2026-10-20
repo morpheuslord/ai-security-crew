@@ -9,6 +9,8 @@ is never passed in, scanned, or returned.
 from dataclasses import dataclass, field
 
 from mcp_security_review.library import Library, load_library
+from mcp_security_review.library.models import Threat
+from mcp_security_review.providers.attack import AttackIndex
 
 MAX_FOCUS_AREAS = 12
 MAX_COMPONENT_CHECKS = 15
@@ -37,6 +39,7 @@ class CodeReviewContextBuilder:
         file_path: str | None = None,
         components: list[str] | None = None,
         data_handled: list[str] | None = None,
+        attack: AttackIndex | None = None,
     ) -> SecurityReviewContext:
         """Build context for AI security review.
 
@@ -45,6 +48,9 @@ class CodeReviewContextBuilder:
             components: Library component ids the code implements, as chosen in
                 the pre-coding review. Targets the checklist at their threats.
             data_handled: Kinds of sensitive data involved (raises the risk level).
+            attack: A loaded ATT&CK index. With it, a focus area whose threat
+                maps to a known technique names it, e.g.
+                `"... (ATT&CK T1190 Exploit Public-Facing Application)"`.
 
         Returns:
             SecurityReviewContext with all information needed for AI review.
@@ -62,7 +68,7 @@ class CodeReviewContextBuilder:
             resolution = self._library.resolve(components, data_handled)
             picked = resolution.picked
             risk_level = resolution.risk_level.value
-            focus_areas.extend(t.name for t in resolution.threats)
+            focus_areas.extend(_focus_area(t, attack) for t in resolution.threats)
             for measure in resolution.countermeasures[:MAX_COMPONENT_CHECKS]:
                 checklist.append(f"{measure.name}: {measure.how_to}")
                 covered.add(measure.id)
@@ -161,6 +167,16 @@ class CodeReviewContextBuilder:
         prompt_parts.append("4. **Recommendations:** Prioritized list of actions")
 
         return "\n".join(prompt_parts)
+
+
+def _focus_area(threat: Threat, attack: AttackIndex | None) -> str:
+    """Name a threat, with its first ATT&CK technique when the index knows it."""
+    if attack is not None:
+        for tid in threat.attack:
+            tech = attack.technique(tid)
+            if tech is not None:
+                return f"{threat.name} (ATT&CK {tech['id']} {tech['name']})"
+    return threat.name
 
 
 def _unique(items: list[str]) -> list[str]:

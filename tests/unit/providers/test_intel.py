@@ -938,13 +938,12 @@ async def test_no_cves_gives_unknown_priority(tmp_path: Path) -> None:
     assert ctx.sources == {}
 
 
-@pytest.mark.anyio
-async def test_build_exploit_contexts_happy_path(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setattr(intel, "_EPSS_CACHE", {})
-    vuln = Vulnerability(id="CVE-2021-44228", summary="s", severity="critical")
-    version, snapshot = "attack-16.1", "kev-07.28.2025"
+_CTID_VERSION, _CTID_SNAPSHOT = "attack-16.1", "kev-07.28.2025"
+
+
+def _exploit_feeds_handler() -> Callable[[httpx.Request], httpx.Response]:
+    """Serve KEV, CTID, and EPSS answers for CVE-2021-44228."""
+    version, snapshot = _CTID_VERSION, _CTID_SNAPSHOT
     mapping_url = (
         f"{CTID_RAW}/{version}/{snapshot}/enterprise/"
         f"{snapshot}_{version}-enterprise.json"
@@ -975,8 +974,18 @@ async def test_build_exploit_contexts_happy_path(
             },
         )
 
+    return handler
+
+
+@pytest.mark.anyio
+async def test_build_exploit_contexts_happy_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(intel, "_EPSS_CACHE", {})
+    vuln = Vulnerability(id="CVE-2021-44228", summary="s", severity="critical")
+
     cache = IntelCache(tmp_path / "cache")
-    async with _client(handler) as c:
+    async with _client(_exploit_feeds_handler()) as c:
         contexts = await build_exploit_contexts([vuln], client=c, cache=cache)
     ctx = contexts["CVE-2021-44228"]
     assert ctx.kev is True
@@ -985,7 +994,57 @@ async def test_build_exploit_contexts_happy_path(
     assert ctx.epss == 0.97
     assert ctx.epss_percentile == 0.99
     assert ctx.priority == "upgrade_now"
-    assert ctx.sources == {"ctid": f"ok (snapshot {snapshot})"}
+    assert ctx.sources == {
+        "ctid": f"ok (snapshot {_CTID_SNAPSHOT})",
+        "attack": attack.PENDING_STATUS,
+    }
+    assert ctx.attack_techniques == [{"id": "T1059.001"}, {"id": "T1190"}]
+
+
+@pytest.mark.anyio
+async def test_build_exploit_contexts_names_techniques_from_the_attack_index(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(intel, "_EPSS_CACHE", {})
+    vuln = Vulnerability(id="CVE-2021-44228", summary="s", severity="critical")
+    cache = IntelCache(tmp_path / "cache")
+    cache.put(
+        attack.ATTACK_INDEX_KEY,
+        {
+            "version": "20.0",
+            "techniques": {
+                "T1190": {"id": "T1190", "name": "Exploit Public-Facing Application"}
+            },
+        },
+    )
+
+    async with _client(_exploit_feeds_handler()) as c:
+        contexts = await build_exploit_contexts([vuln], client=c, cache=cache)
+    ctx = contexts["CVE-2021-44228"]
+    assert ctx.sources["attack"] == "ok (ATT&CK 20.0)"
+    # Ids the index does not know keep the id only.
+    assert ctx.attack_techniques == [
+        {"id": "T1059.001"},
+        {"id": "T1190", "name": "Exploit Public-Facing Application"},
+    ]
+
+
+@pytest.mark.anyio
+async def test_build_exploit_contexts_survives_a_broken_attack_index(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(intel, "_EPSS_CACHE", {})
+    vuln = Vulnerability(id="CVE-2021-44228", summary="s", severity="critical")
+
+    def boom(cls: object, cache: object = None) -> None:
+        raise RuntimeError("disk on fire")
+
+    monkeypatch.setattr(attack.AttackIndex, "load", classmethod(boom))
+    cache = IntelCache(tmp_path / "cache")
+    async with _client(_exploit_feeds_handler()) as c:
+        contexts = await build_exploit_contexts([vuln], client=c, cache=cache)
+    ctx = contexts["CVE-2021-44228"]
+    assert ctx.sources["attack"] == "unavailable: error"
     assert ctx.attack_techniques == [{"id": "T1059.001"}, {"id": "T1190"}]
 
 

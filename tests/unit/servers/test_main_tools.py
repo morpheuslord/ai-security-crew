@@ -9,6 +9,7 @@ EXPECTED_TOOLS = {
     "general_verify_code_security",
     "sca_scan_dependencies",
     "sca_verify_packages",
+    "threatmodel_attack_technique",
     "threatmodel_perform_threat_model",
     "threatmodel_update_threat_model_file",
 }
