@@ -8,18 +8,8 @@ from typing import Any
 import pytest
 from fastmcp import Client
 
-from mcp_security_review.providers.attack import (
-    ATTACK_INDEX_KEY,
-    PENDING_STATUS,
-    build_index,
-)
-from mcp_security_review.providers.intel import IntelCache
-from mcp_security_review.servers import library_support
+from mcp_security_review.providers.attack import PENDING_STATUS
 from mcp_security_review.servers.main import main_mcp
-
-ATTACK_FIXTURE = (
-    Path(__file__).parents[2] / "fixtures" / "attack-enterprise-subset.json"
-)
 
 TOOL = "general_lightweight_security_review"
 
@@ -211,9 +201,8 @@ async def test_invalid_project_library_returns_a_clear_error(tmp_path: Path) -> 
 
 
 @pytest.mark.anyio
+@pytest.mark.usefixtures("cached_attack")
 async def test_review_threats_carry_attack_names() -> None:
-    IntelCache().put(ATTACK_INDEX_KEY, build_index(ATTACK_FIXTURE))
-
     data = await call(task_description="Search page", components="database")
 
     assessment = data["assessment"]
@@ -226,19 +215,6 @@ async def test_review_threats_carry_attack_names() -> None:
         "revoked_by": None,
     }
     assert assessment["sources"] == {"attack": "ok (ATT&CK 20.0)"}
-
-
-@pytest.fixture
-def refresh_calls(monkeypatch: pytest.MonkeyPatch) -> list[object]:
-    """Record background ATT&CK refreshes the tool asks for."""
-    calls: list[object] = []
-
-    def fake(cache: object = None) -> bool:
-        calls.append(cache)
-        return True
-
-    monkeypatch.setattr(library_support, "ensure_attack_index_background", fake)
-    return calls
 
 
 @pytest.mark.anyio

@@ -14,15 +14,7 @@ from mcp_security_review.library import (
 )
 from mcp_security_review.library.library import Library
 from mcp_security_review.library.models import Threat
-from mcp_security_review.providers.attack import (
-    PENDING_STATUS,
-    AttackIndex,
-    build_index,
-)
-
-ATTACK_FIXTURE = (
-    Path(__file__).parents[2] / "fixtures" / "attack-enterprise-subset.json"
-)
+from mcp_security_review.providers.attack import PENDING_STATUS, AttackIndex
 
 ASVS_IDS = {
     line.strip()
@@ -198,9 +190,9 @@ def test_baseline_countermeasures_are_flagged(library: Library) -> None:
 # ---- ATT&CK ----
 
 
-@pytest.fixture(scope="module")
-def attack_index() -> AttackIndex:
-    return AttackIndex.from_dict(build_index(ATTACK_FIXTURE))
+@pytest.fixture
+def attack_index(attack_data: dict[str, Any]) -> AttackIndex:
+    return AttackIndex.from_dict(attack_data)
 
 
 def test_every_attack_id_exists_and_is_current(
@@ -226,6 +218,21 @@ def test_attack_ids_follow_the_library_mapping(library: Library) -> None:
     assert "T1552.005" in threats["ssrf"].attack
     assert threats["public-bucket"].attack == ["T1530"]
     assert "T1195.001" in threats["typosquatted-package"].attack
+    # The most specific sub-technique, not its parent.
+    assert threats["default-accounts"].attack == ["T1078.001"]
+    assert threats["weak-password-rules"].attack == ["T1110.001"]
+    assert threats["weak-password-storage"].attack == ["T1110.002"]
+    assert threats["session-fixation"].attack == ["T1550.004"]
+    assert threats["model-cost-abuse"].attack == ["T1496.004"]
+
+
+def test_prompt_injection_threats_are_mapped_alike(library: Library) -> None:
+    # Prompt injection is not an ATT&CK Enterprise technique (it is in
+    # MITRE ATLAS); what an injected agent then does is mapped on the
+    # agent-permission threats instead.
+    assert library.threats["prompt-injection"].attack == []
+    assert library.threats["indirect-prompt-injection"].attack == []
+    assert library.threats["excessive-agent-permissions"].attack == ["T1059"]
 
 
 def test_threat_rejects_malformed_attack_ids() -> None:

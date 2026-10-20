@@ -941,9 +941,9 @@ class ExploitContext:
             EPSS could not be checked or had no score for any of them.
         epss_percentile: The percentile for `epss`, or `None`.
         attack_techniques: MITRE ATT&CK techniques linked to this
-            vulnerability via the CTID KEV mapping, as `{"id", "name"}`
-            when the cached ATT&CK index names the technique, else just
-            `{"id"}`. Empty when CTID has no mapping for any of `cves`, or
+            vulnerability via the CTID KEV mapping, as `attack_summary`
+            items: `{"id", "name", "tactics", "revoked", "revoked_by"}` when
+            the cached ATT&CK index knows the technique, else just `{"id"}`. Empty when CTID has no mapping for any of `cves`, or
             when CTID could not be checked.
         priority: `"upgrade_now"`, `"check_reachability"`, or `"unknown"`
             (no CVE ids to look up).
@@ -963,7 +963,7 @@ class ExploitContext:
     kev_due_date: str | None
     epss: float | None
     epss_percentile: float | None
-    attack_techniques: list[dict[str, str]] = field(default_factory=list)
+    attack_techniques: list[dict[str, Any]] = field(default_factory=list)
     priority: str = "unknown"
     sources: dict[str, str] = field(default_factory=dict)
 
@@ -985,6 +985,9 @@ class ExploitContext:
 def _load_attack_index(cache: IntelCache) -> tuple["AttackIndex | None", str]:
     """Read the cached ATT&CK index for naming techniques, never raising.
 
+    When the index is missing or stale, a background refresh is started (it
+    never blocks) so later scans get current names.
+
     Returns:
         `(index, status)`. The index is None when none is cached (status is
         the pending status) or reading failed (`"unavailable: error"`);
@@ -992,26 +995,34 @@ def _load_attack_index(cache: IntelCache) -> tuple["AttackIndex | None", str]:
     """
     try:
         # Imported lazily: attack.py imports from this module.
-        from mcp_security_review.providers.attack import AttackIndex, attack_summary
+        from mcp_security_review.providers import attack as attack_provider
 
-        index = AttackIndex.load(cache)
-        _, status = attack_summary([], index)
+        index = attack_provider.AttackIndex.load(cache)
+        if index is None or index.is_stale:
+            attack_provider.ensure_attack_index_background(cache)
+        _, status = attack_provider.attack_summary([], index)
         return index, status
     except Exception:  # defensive: exploit context must never raise
         logger.exception("ATT&CK index lookup failed")
         return None, "unavailable: error"
 
 
-def _named_techniques(
+def _summarise_techniques(
     tids: list[str], index: "AttackIndex | None"
-) -> list[dict[str, str]]:
-    """Turn technique ids into `{"id", "name"}`, or `{"id"}` when unnamed."""
-    out: list[dict[str, str]] = []
-    for tid in tids:
-        tech = index.technique(tid) if index is not None else None
-        name = tech.get("name") if tech is not None else None
-        out.append({"id": tid, "name": name} if isinstance(name, str) else {"id": tid})
-    return out
+) -> list[dict[str, Any]]:
+    """Describe technique ids with `attack_summary`, never raising.
+
+    Known techniques carry `name`, `tactics`, `revoked`, and `revoked_by`, so
+    an id CTID maps that ATT&CK has since revoked reaches the agent flagged.
+    """
+    try:
+        from mcp_security_review.providers.attack import attack_summary
+
+        items, _ = attack_summary(tids, index)
+        return items
+    except Exception:  # defensive: exploit context must never raise
+        logger.exception("ATT&CK technique summary failed")
+        return [{"id": tid} for tid in tids]
 
 
 async def build_exploit_contexts(
@@ -1032,7 +1043,8 @@ async def build_exploit_contexts(
     (`"unavailable: <code>"`) and the corresponding fields are left `None`
     or empty, but the function still returns a context for every
     vulnerability passed in. Technique names come from the cached ATT&CK
-    index; without one the techniques keep their ids only.
+    index; without one the techniques keep their ids only, and a missing or
+    stale index starts a background refresh for later calls.
 
     Args:
         vulns: Vulnerabilities to build context for. Only `.id` and
@@ -1132,7 +1144,7 @@ async def build_exploit_contexts(
             kev_flag = None if kev_unavailable is not None else kev_entry is not None
             pct = epss_entry.percentile if epss_entry is not None else None
 
-            attack_techniques: list[dict[str, str]] = []
+            attack_techniques: list[dict[str, Any]] = []
             if ctid_unavailable is not None:
                 sources["ctid"] = ctid_unavailable
             elif ctid_mapping is not None:
@@ -1143,7 +1155,7 @@ async def build_exploit_contexts(
                 if attack_state is None:
                     attack_state = _load_attack_index(active_cache)
                 attack_index, sources["attack"] = attack_state
-                attack_techniques = _named_techniques(
+                attack_techniques = _summarise_techniques(
                     sorted(technique_ids), attack_index
                 )
 

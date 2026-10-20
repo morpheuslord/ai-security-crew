@@ -1001,22 +1001,28 @@ async def test_build_exploit_contexts_happy_path(
     assert ctx.attack_techniques == [{"id": "T1059.001"}, {"id": "T1190"}]
 
 
+_SMALL_ATTACK_INDEX: dict[str, Any] = {
+    "version": "20.0",
+    "techniques": {
+        "T1190": {
+            "id": "T1190",
+            "name": "Exploit Public-Facing Application",
+            "tactics": ["initial-access"],
+            "revoked": False,
+            "revoked_by": None,
+        },
+    },
+}
+
+
 @pytest.mark.anyio
 async def test_build_exploit_contexts_names_techniques_from_the_attack_index(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, refresh_calls: list[object]
 ) -> None:
     monkeypatch.setattr(intel, "_EPSS_CACHE", {})
     vuln = Vulnerability(id="CVE-2021-44228", summary="s", severity="critical")
     cache = IntelCache(tmp_path / "cache")
-    cache.put(
-        attack.ATTACK_INDEX_KEY,
-        {
-            "version": "20.0",
-            "techniques": {
-                "T1190": {"id": "T1190", "name": "Exploit Public-Facing Application"}
-            },
-        },
-    )
+    cache.put(attack.ATTACK_INDEX_KEY, _SMALL_ATTACK_INDEX)
 
     async with _client(_exploit_feeds_handler()) as c:
         contexts = await build_exploit_contexts([vuln], client=c, cache=cache)
@@ -1025,8 +1031,75 @@ async def test_build_exploit_contexts_names_techniques_from_the_attack_index(
     # Ids the index does not know keep the id only.
     assert ctx.attack_techniques == [
         {"id": "T1059.001"},
-        {"id": "T1190", "name": "Exploit Public-Facing Application"},
+        {
+            "id": "T1190",
+            "name": "Exploit Public-Facing Application",
+            "tactics": ["initial-access"],
+            "revoked": False,
+            "revoked_by": None,
+        },
     ]
+    # A fresh index needs no refresh.
+    assert refresh_calls == []
+
+
+@pytest.mark.anyio
+async def test_build_exploit_contexts_flags_techniques_attack_revoked(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # CTID maps to an older ATT&CK release, so it can name ids that the
+    # current release has revoked; those must reach the agent flagged.
+    monkeypatch.setattr(intel, "_EPSS_CACHE", {})
+    vuln = Vulnerability(id="CVE-2021-44228", summary="s", severity="critical")
+    data = json.loads(json.dumps(_SMALL_ATTACK_INDEX))
+    data["techniques"]["T1059.001"] = {
+        "id": "T1059.001",
+        "name": "PowerShell",
+        "tactics": ["execution"],
+        "revoked": True,
+        "revoked_by": "T1059",
+    }
+    cache = IntelCache(tmp_path / "cache")
+    cache.put(attack.ATTACK_INDEX_KEY, data)
+
+    async with _client(_exploit_feeds_handler()) as c:
+        contexts = await build_exploit_contexts([vuln], client=c, cache=cache)
+    revoked = contexts["CVE-2021-44228"].attack_techniques[0]
+    assert revoked["id"] == "T1059.001"
+    assert revoked["revoked"] is True
+    assert revoked["revoked_by"] == "T1059"
+
+
+@pytest.mark.anyio
+async def test_build_exploit_contexts_refreshes_a_missing_attack_index(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, refresh_calls: list[object]
+) -> None:
+    monkeypatch.setattr(intel, "_EPSS_CACHE", {})
+    vuln = Vulnerability(id="CVE-2021-44228", summary="s", severity="critical")
+    cache = IntelCache(tmp_path / "cache")
+
+    async with _client(_exploit_feeds_handler()) as c:
+        await build_exploit_contexts([vuln, vuln], client=c, cache=cache)
+    # One start per call, with the cache the scan uses.
+    assert refresh_calls == [cache]
+
+
+@pytest.mark.anyio
+async def test_build_exploit_contexts_refreshes_a_stale_attack_index(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, refresh_calls: list[object]
+) -> None:
+    monkeypatch.setattr(intel, "_EPSS_CACHE", {})
+    monkeypatch.setattr(attack.AttackIndex, "is_stale", property(lambda self: True))
+    vuln = Vulnerability(id="CVE-2021-44228", summary="s", severity="critical")
+    cache = IntelCache(tmp_path / "cache")
+    cache.put(attack.ATTACK_INDEX_KEY, _SMALL_ATTACK_INDEX)
+
+    async with _client(_exploit_feeds_handler()) as c:
+        contexts = await build_exploit_contexts([vuln], client=c, cache=cache)
+    assert contexts["CVE-2021-44228"].attack_techniques[1]["name"] == (
+        "Exploit Public-Facing Application"
+    )
+    assert refresh_calls == [cache]
 
 
 @pytest.mark.anyio

@@ -20,8 +20,9 @@ from mcp_security_review.providers.attack import (
     refresh_attack_index,
 )
 from mcp_security_review.providers.intel import FetchError, IntelCache
+from tests.conftest import ATTACK_FIXTURE
 
-FIXTURE = Path(__file__).parents[2] / "fixtures" / "attack-enterprise-subset.json"
+FIXTURE = ATTACK_FIXTURE
 
 
 @pytest.fixture(scope="module")

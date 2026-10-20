@@ -170,12 +170,16 @@ class CodeReviewContextBuilder:
 
 
 def _focus_area(threat: Threat, attack: AttackIndex | None) -> str:
-    """Name a threat, with its first ATT&CK technique when the index knows it."""
+    """Name a threat with its first current ATT&CK technique the index knows.
+
+    Techniques ATT&CK has revoked or deprecated are skipped.
+    """
     if attack is not None:
         for tid in threat.attack:
             tech = attack.technique(tid)
-            if tech is not None:
-                return f"{threat.name} (ATT&CK {tech['id']} {tech['name']})"
+            if tech is None or tech.get("revoked") or tech.get("deprecated"):
+                continue
+            return f"{threat.name} (ATT&CK {tech['id']} {tech['name']})"
     return threat.name
 
 

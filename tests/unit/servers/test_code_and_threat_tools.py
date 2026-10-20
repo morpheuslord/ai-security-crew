@@ -8,19 +8,9 @@ from typing import Any
 import pytest
 from fastmcp import Client
 
-from mcp_security_review.providers.attack import (
-    ATTACK_INDEX_KEY,
-    PENDING_STATUS,
-    AttackIndex,
-    build_index,
-)
-from mcp_security_review.providers.intel import IntelCache
+from mcp_security_review.providers.attack import PENDING_STATUS, AttackIndex
 from mcp_security_review.servers import library_support
 from mcp_security_review.servers.main import main_mcp
-
-ATTACK_FIXTURE = (
-    Path(__file__).parents[2] / "fixtures" / "attack-enterprise-subset.json"
-)
 
 
 async def call(tool: str, **args: Any) -> dict[str, Any]:
@@ -33,30 +23,6 @@ async def call(tool: str, **args: Any) -> dict[str, Any]:
 VERIFY = "general_verify_code_security"
 THREAT = "threatmodel_perform_threat_model"
 ATTACK = "threatmodel_attack_technique"
-
-
-@pytest.fixture(scope="module")
-def attack_data() -> dict[str, Any]:
-    return build_index(ATTACK_FIXTURE)
-
-
-@pytest.fixture
-def cached_attack(attack_data: dict[str, Any]) -> None:
-    """Put the fixture ATT&CK index in the (per-test) intel cache."""
-    IntelCache().put(ATTACK_INDEX_KEY, attack_data)
-
-
-@pytest.fixture
-def refresh_calls(monkeypatch: pytest.MonkeyPatch) -> list[object]:
-    """Record background ATT&CK refreshes the tools ask for."""
-    calls: list[object] = []
-
-    def fake(cache: object = None) -> bool:
-        calls.append(cache)
-        return True
-
-    monkeypatch.setattr(library_support, "ensure_attack_index_background", fake)
-    return calls
 
 
 @pytest.mark.anyio
@@ -190,6 +156,32 @@ async def test_verify_focus_areas_name_attack_techniques() -> None:
         "(ATT&CK T1190 Exploit Public-Facing Application)"
     ) in data["focus_areas"]
     assert "(ATT&CK T1190 Exploit Public-Facing Application)" in data["review_prompt"]
+
+
+@pytest.mark.anyio
+@pytest.mark.usefixtures("cached_attack")
+async def test_verify_focus_areas_skip_revoked_techniques(tmp_path: Path) -> None:
+    folder = tmp_path / ".ai-security-crew" / "library"
+    folder.mkdir(parents=True)
+    (folder / "team.yaml").write_text(
+        "threats:\n"
+        "  - id: keys-in-repo\n"
+        "    name: Deploy keys sit in the repo\n"
+        "    components: [secrets-and-config]\n"
+        "    severity: high\n"
+        "    attack: [T1081, T1064, T1552.001]\n"  # revoked, deprecated, current
+        "    countermeasures: [secrets-manager]\n",
+        encoding="utf-8",
+    )
+
+    data = await call(
+        VERIFY, components="secrets-and-config", project_root=str(tmp_path)
+    )
+
+    assert (
+        "Deploy keys sit in the repo (ATT&CK T1552.001 Credentials In Files)"
+        in data["focus_areas"]
+    )
 
 
 @pytest.mark.anyio
