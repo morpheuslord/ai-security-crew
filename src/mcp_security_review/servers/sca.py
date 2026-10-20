@@ -9,6 +9,8 @@ import logging
 import re
 from typing import Annotated, Any
 
+import anyio
+import httpx
 from fastmcp import Context, FastMCP
 from pydantic import Field
 
@@ -224,14 +226,7 @@ async def scan_dependencies(
         return json.dumps(response, indent=2, ensure_ascii=False)
 
     all_vulns = [v for r in vulnerable_results for v in r.vulnerabilities]
-    client = new_client()
-    try:
-        exploit_contexts = await build_exploit_contexts(all_vulns, client=client)
-    except Exception:  # enrichment is best effort; the scan must not fail
-        logger.exception("Exploit context enrichment failed")
-        exploit_contexts = _unavailable_contexts(all_vulns)
-    finally:
-        await client.aclose()
+    exploit_contexts = await _exploit_contexts_for(all_vulns)
 
     response["status"] = "vulnerabilities_found"
     response["results"] = [
@@ -244,14 +239,7 @@ async def scan_dependencies(
         )
         for r in vulnerable_results
     ]
-    response["upgrade_now"] = sorted(
-        {
-            v.id
-            for v in all_vulns
-            if (ctx := exploit_contexts.get(v.id)) is not None
-            and ctx.priority == "upgrade_now"
-        }
-    )
+    response["upgrade_now"] = _upgrade_now_ids(all_vulns, exploit_contexts)
     response["action_required"] = (
         "For each vulnerability, answer its reachability_check from your "
         "own code. Upgrade to the fixed version when the affected "
@@ -292,12 +280,14 @@ async def lookup_vulnerability(
 
     Returns:
         JSON with `results`: one entry per requested id, in request
-        order, each `{"id", "status"}` where `status` is `found`,
-        `not_found`, `invalid_id`, or `lookup_failed`. A `found` entry
-        also carries the vulnerability's details (minus the
-        reachability_check, which needs a package context this tool
-        does not have), its `affected_packages`, and `exploit_context`.
-        `upgrade_now` lists ids CISA KEV or top-EPSS flags.
+        order. Every entry carries `requested_id` (the exact string the
+        caller passed) and `status` (`found`, `not_found`, `invalid_id`,
+        or `lookup_failed`). A `found` entry also carries OSV's canonical
+        `id` (which can differ from `requested_id`, e.g. an alias), the
+        vulnerability's details (minus the reachability_check, which
+        needs a package context this tool does not have), its
+        `affected_packages`, and `exploit_context`. `upgrade_now` lists
+        canonical ids CISA KEV or top-EPSS flags.
     """
     ids = _split_vulnerability_ids(vulnerability_ids)
     if len(ids) > _MAX_LOOKUP_IDS:
@@ -307,45 +297,37 @@ async def lookup_vulnerability(
             "Split the ids across multiple calls.",
         )
 
-    scanner = OSVScanner()
     statuses: dict[str, str] = {}
-    vulns: dict[str, Vulnerability] = {}
+    valid_ids: list[str] = []
     for vuln_id in ids:
-        if not _VULN_ID_RE.match(vuln_id):
+        if _VULN_ID_RE.match(vuln_id):
+            valid_ids.append(vuln_id)
+        else:
             statuses[vuln_id] = "invalid_id"
-            continue
-        try:
-            vuln = await scanner.lookup(vuln_id)
-        except Exception:  # a bad id or upstream hiccup must not fail the batch
-            logger.exception("OSV lookup failed for %s", vuln_id)
-            statuses[vuln_id] = "lookup_failed"
-            continue
-        if vuln is None:
-            statuses[vuln_id] = "not_found"
-            continue
-        statuses[vuln_id] = "found"
-        vulns[vuln_id] = vuln
 
+    scanner = OSVScanner()
+    vulns: dict[str, Vulnerability] = {}
     client = new_client()
     try:
-        exploit_contexts = await build_exploit_contexts(
-            list(vulns.values()), client=client
-        )
-    except Exception:  # enrichment is best effort; the lookup must not fail
-        logger.exception("Exploit context enrichment failed")
-        exploit_contexts = _unavailable_contexts(list(vulns.values()))
+        async with anyio.create_task_group() as tg:
+            for vuln_id in valid_ids:
+                tg.start_soon(_lookup_one, scanner, client, vuln_id, statuses, vulns)
     finally:
         await client.aclose()
+
+    exploit_contexts = await _exploit_contexts_for(list(vulns.values()))
 
     results: list[dict[str, Any]] = []
     for vuln_id in ids:
         status = statuses[vuln_id]
+        entry: dict[str, Any] = {"requested_id": vuln_id}
         if status != "found":
-            results.append({"id": vuln_id, "status": status})
+            entry["status"] = status
+            results.append(entry)
             continue
         vuln = vulns[vuln_id]
         context = exploit_contexts.get(vuln.id)
-        entry = vuln.to_dict(context.to_dict() if context else None)
+        entry.update(vuln.to_dict(context.to_dict() if context else None))
         entry.pop("reachability_check", None)
         entry["status"] = "found"
         entry["affected_packages"] = vuln.affected_packages
@@ -354,16 +336,69 @@ async def lookup_vulnerability(
     response: dict[str, Any] = {
         "success": True,
         "results": results,
-        "upgrade_now": sorted(
-            {
-                vuln.id
-                for vuln in vulns.values()
-                if (context := exploit_contexts.get(vuln.id)) is not None
-                and context.priority == "upgrade_now"
-            }
-        ),
+        "upgrade_now": _upgrade_now_ids(list(vulns.values()), exploit_contexts),
     }
     return json.dumps(response, indent=2, ensure_ascii=False)
+
+
+async def _lookup_one(
+    scanner: OSVScanner,
+    client: httpx.AsyncClient,
+    vuln_id: str,
+    statuses: dict[str, str],
+    vulns: dict[str, Vulnerability],
+) -> None:
+    """Look up one id against the shared client, isolating its failure.
+
+    Writes its outcome into `statuses` (and `vulns` when found) keyed by
+    `vuln_id`. Every `vuln_id` passed in across the batch is distinct, so
+    concurrent writes never collide. A failure here must not fail the
+    rest of the batch, hence the broad catch.
+    """
+    try:
+        vuln = await scanner.lookup(vuln_id, client=client)
+    except Exception:  # a bad id or upstream hiccup must not fail the batch
+        logger.exception("OSV lookup failed for %s", vuln_id)
+        statuses[vuln_id] = "lookup_failed"
+        return
+    if vuln is None:
+        statuses[vuln_id] = "not_found"
+        return
+    statuses[vuln_id] = "found"
+    vulns[vuln_id] = vuln
+
+
+async def _exploit_contexts_for(
+    vulns: list[Vulnerability],
+) -> dict[str, ExploitContext]:
+    """Build exploit context for `vulns`, owning the client's lifecycle.
+
+    Shared by `scan_dependencies` and `lookup_vulnerability`. Never
+    raises: enrichment is best effort, so a failure falls back to
+    `_unavailable_contexts` instead of failing the caller's tool call.
+    """
+    client = new_client()
+    try:
+        return await build_exploit_contexts(vulns, client=client)
+    except Exception:  # enrichment is best effort; the caller must not fail
+        logger.exception("Exploit context enrichment failed")
+        return _unavailable_contexts(vulns)
+    finally:
+        await client.aclose()
+
+
+def _upgrade_now_ids(
+    vulns: list[Vulnerability], exploit_contexts: dict[str, ExploitContext]
+) -> list[str]:
+    """Sorted canonical ids whose exploit context says upgrade now."""
+    return sorted(
+        {
+            v.id
+            for v in vulns
+            if (context := exploit_contexts.get(v.id)) is not None
+            and context.priority == "upgrade_now"
+        }
+    )
 
 
 def _unavailable_contexts(vulns: list[Vulnerability]) -> dict[str, ExploitContext]:

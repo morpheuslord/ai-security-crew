@@ -5,6 +5,7 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 from unittest.mock import patch
 
+import anyio
 import pytest
 from fastmcp import Client
 
@@ -195,7 +196,9 @@ async def lookup(
     build_contexts: BuildContexts | None = None,
     **args: Any,
 ) -> dict[str, Any]:
-    async def fake(self: OSVScanner, vuln_id: str) -> Vulnerability | None:
+    async def fake(
+        self: OSVScanner, vuln_id: str, *, client: Any = None
+    ) -> Vulnerability | None:
         outcome = lookups[vuln_id]
         if isinstance(outcome, Exception):
             raise outcome
@@ -245,6 +248,7 @@ async def test_lookup_found_with_exploit_context() -> None:
     )
     assert data["success"] is True
     result = data["results"][0]
+    assert result["requested_id"] == "CVE-2021-44228"
     assert result["id"] == "CVE-2021-44228"
     assert result["status"] == "found"
     assert "reachability_check" not in result
@@ -254,10 +258,28 @@ async def test_lookup_found_with_exploit_context() -> None:
 
 
 @pytest.mark.anyio
+async def test_lookup_found_reports_canonical_id_when_different() -> None:
+    """OSV can resolve a requested id to a different canonical record
+
+    (e.g. the requested id is an alias of the record OSV returns). Both
+    the caller's original string and OSV's canonical id must be visible.
+    """
+    vuln = Vulnerability(id="GHSA-jfh8-c2jp-5v3q", summary="s", severity="critical")
+
+    data = await lookup({"CVE-2021-44228": vuln}, vulnerability_ids="CVE-2021-44228")
+
+    assert data["success"] is True
+    result = data["results"][0]
+    assert result["requested_id"] == "CVE-2021-44228"
+    assert result["id"] == "GHSA-jfh8-c2jp-5v3q"
+    assert result["status"] == "found"
+
+
+@pytest.mark.anyio
 async def test_lookup_not_found_is_not_failure() -> None:
     data = await lookup({"CVE-2099-0001": None}, vulnerability_ids="CVE-2099-0001")
     assert data["success"] is True
-    assert data["results"] == [{"id": "CVE-2099-0001", "status": "not_found"}]
+    assert data["results"] == [{"requested_id": "CVE-2099-0001", "status": "not_found"}]
 
 
 @pytest.mark.anyio
@@ -271,7 +293,7 @@ async def test_lookup_mixed_valid_invalid() -> None:
         vulnerability_ids="CVE-2021-44228, not-an-id!!",
     )
     assert data["success"] is True
-    statuses = {r["id"]: r["status"] for r in data["results"]}
+    statuses = {r["requested_id"]: r["status"] for r in data["results"]}
     assert statuses["CVE-2021-44228"] == "found"
     assert statuses["not-an-id!!"] == "invalid_id"
 
@@ -291,14 +313,18 @@ async def test_lookup_osv_down_marks_lookup_failed() -> None:
         vulnerability_ids="CVE-2021-44228",
     )
     assert data["success"] is True
-    assert data["results"] == [{"id": "CVE-2021-44228", "status": "lookup_failed"}]
+    assert data["results"] == [
+        {"requested_id": "CVE-2021-44228", "status": "lookup_failed"}
+    ]
 
 
 @pytest.mark.anyio
 async def test_lookup_path_injection_id_rejected() -> None:
     called = False
 
-    async def fake(self: OSVScanner, vuln_id: str) -> Vulnerability | None:
+    async def fake(
+        self: OSVScanner, vuln_id: str, *, client: Any = None
+    ) -> Vulnerability | None:
         nonlocal called
         called = True
         return None
@@ -313,4 +339,64 @@ async def test_lookup_path_injection_id_rejected() -> None:
     data = json.loads(items[0].text)
 
     assert called is False
-    assert data["results"] == [{"id": "../../v1/query", "status": "invalid_id"}]
+    assert data["results"] == [
+        {"requested_id": "../../v1/query", "status": "invalid_id"}
+    ]
+
+
+@pytest.mark.anyio
+async def test_lookup_shares_one_client_across_ids() -> None:
+    """`OSVScanner.lookup` must be called with the same shared client for
+
+    every id in the batch, not a fresh client per id.
+    """
+    seen_clients: list[Any] = []
+
+    async def fake(
+        self: OSVScanner, vuln_id: str, *, client: Any = None
+    ) -> Vulnerability | None:
+        seen_clients.append(client)
+        return Vulnerability(id=vuln_id, summary="s", severity="low")
+
+    with patch.object(OSVScanner, "lookup", fake):
+        async with Client(main_mcp) as client:
+            result = await client.call_tool(
+                "sca_lookup_vulnerability",
+                {"vulnerability_ids": "CVE-2021-44228, CVE-2021-44229"},
+            )
+    items = result if isinstance(result, list) else result.content
+    data = json.loads(items[0].text)
+
+    assert data["success"] is True
+    assert len(seen_clients) == 2
+    assert all(c is not None for c in seen_clients)
+    assert seen_clients[0] is seen_clients[1]
+
+
+@pytest.mark.anyio
+async def test_lookup_preserves_request_order_under_concurrency() -> None:
+    """Results must come back in request order even when ids resolve out
+
+    of order, since lookups now run concurrently.
+    """
+
+    async def fake(
+        self: OSVScanner, vuln_id: str, *, client: Any = None
+    ) -> Vulnerability | None:
+        if vuln_id == "CVE-2021-44228":
+            await anyio.sleep(0.05)
+        return Vulnerability(id=vuln_id, summary="s", severity="low")
+
+    with patch.object(OSVScanner, "lookup", fake):
+        async with Client(main_mcp) as client:
+            result = await client.call_tool(
+                "sca_lookup_vulnerability",
+                {"vulnerability_ids": "CVE-2021-44228, CVE-2021-44229"},
+            )
+    items = result if isinstance(result, list) else result.content
+    data = json.loads(items[0].text)
+
+    assert [r["requested_id"] for r in data["results"]] == [
+        "CVE-2021-44228",
+        "CVE-2021-44229",
+    ]

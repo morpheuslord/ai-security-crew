@@ -491,3 +491,24 @@ class TestOSVScannerLookup:
         assert vuln is not None
         assert len(vuln.affected_packages) <= 20
         assert {"ecosystem": "PyPI", "name": "pyjwt"} in vuln.affected_packages
+
+    @pytest.mark.asyncio
+    async def test_lookup_reuses_given_client_and_does_not_close_it(self) -> None:
+        """A caller looking up many ids shares one client across calls;
+
+        `lookup` must use it as-is and never build or close its own.
+        """
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json={"id": "GHSA-x"})
+
+        given_client = _mock_client(handler)
+        with patch(
+            "mcp_security_review.providers.sca.osv.new_client",
+            side_effect=AssertionError("new_client should not be called"),
+        ):
+            vuln = await OSVScanner().lookup("GHSA-x", client=given_client)
+
+        assert vuln is not None
+        assert given_client.is_closed is False
+        await given_client.aclose()

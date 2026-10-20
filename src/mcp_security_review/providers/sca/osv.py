@@ -457,7 +457,9 @@ class OSVScanner:
             affected_packages=self._extract_affected_packages(vuln_data),
         )
 
-    async def lookup(self, vuln_id: str) -> Vulnerability | None:
+    async def lookup(
+        self, vuln_id: str, *, client: httpx.AsyncClient | None = None
+    ) -> Vulnerability | None:
         """Look up a single vulnerability by id via `GET /v1/vulns/{id}`.
 
         The id is URL-encoded before it is placed in the path, regardless
@@ -466,6 +468,11 @@ class OSVScanner:
 
         Args:
             vuln_id: The OSV, CVE, or GHSA id to look up.
+            client: An existing client to reuse. Not closed by this call;
+                the caller owns its lifecycle. When omitted, a new one is
+                created via `new_client` and closed here, which is fine
+                for a single ad hoc lookup - a caller looking up many ids
+                should share one client across calls instead.
 
         Returns:
             The parsed `Vulnerability`, or `None` when OSV has no record
@@ -477,15 +484,19 @@ class OSVScanner:
                 cap.
         """
         url = f"{OSV_API_URL}/vulns/{quote(vuln_id, safe='')}"
-        client = new_client(timeout=self._timeout)
+        owns_client = client is None
+        active_client = (
+            client if client is not None else new_client(timeout=self._timeout)
+        )
         try:
-            data = await fetch_json(client, url, max_bytes=_LOOKUP_MAX_BYTES)
+            data = await fetch_json(active_client, url, max_bytes=_LOOKUP_MAX_BYTES)
         except FetchError as exc:
             if exc.code == "http_404":
                 return None
             raise
         finally:
-            await client.aclose()
+            if owns_client:
+                await active_client.aclose()
         return self.parse_vuln(data)
 
     def _extract_severity(self, vuln_data: dict) -> str:
