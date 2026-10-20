@@ -111,6 +111,25 @@ async def test_slow_drip_body_times_out(monkeypatch: pytest.MonkeyPatch) -> None
 
 
 @pytest.mark.anyio
+async def test_deadline_override_applies_per_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A large feed can ask for a longer (or shorter) wall-clock deadline."""
+    monkeypatch.setattr(intel, "MAX_FETCH_SECONDS", 0.05)
+
+    async def drip() -> AsyncIterator[bytes]:
+        for _ in range(4):
+            await anyio.sleep(0.05)
+            yield b"."
+
+    async with _client(lambda r: httpx.Response(200, content=drip())) as c:
+        resp = await fetch_bytes(
+            c, "https://feed.example.com/x", max_bytes=MB, deadline=5.0
+        )
+    assert resp.content == b"...."
+
+
+@pytest.mark.anyio
 async def test_redirect_to_private_host_blocked(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -192,6 +192,7 @@ async def fetch_bytes(
     headers: dict[str, str] | None = None,
     method: str = "GET",
     guard_host: bool = False,
+    deadline: float | None = None,
 ) -> httpx.Response:
     """Fetch an HTTPS URL with a byte cap and manual, re-checked redirects.
 
@@ -206,6 +207,9 @@ async def fetch_bytes(
             credentials in the URL or a port other than 443. Use it whenever
             the host comes from user or upstream input. Without it, a
             redirect to a different host is still checked.
+        deadline: Wall-clock seconds for the whole fetch, redirects
+            included. Defaults to `MAX_FETCH_SECONDS`; raise it only for a
+            large fixed feed.
 
     Returns:
         A fully read response whose `content` is the decoded body.
@@ -213,8 +217,9 @@ async def fetch_bytes(
     Raises:
         FetchError: On any failure; see the class for codes.
     """
+    limit = MAX_FETCH_SECONDS if deadline is None else deadline
     try:
-        with anyio.fail_after(MAX_FETCH_SECONDS):
+        with anyio.fail_after(limit):
             return await _fetch(
                 client,
                 url,
@@ -224,9 +229,7 @@ async def fetch_bytes(
                 guard_host=guard_host,
             )
     except TimeoutError as exc:
-        raise FetchError(
-            "timeout", f"no full response in {MAX_FETCH_SECONDS}s"
-        ) from exc
+        raise FetchError("timeout", f"no full response in {limit}s") from exc
     except httpx.TimeoutException as exc:
         raise FetchError("timeout", type(exc).__name__) from exc
     except httpx.TransportError as exc:
