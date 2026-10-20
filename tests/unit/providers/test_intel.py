@@ -16,6 +16,8 @@ import pytest
 from mcp_security_review.guard.clip import OMITTED
 from mcp_security_review.providers import intel
 from mcp_security_review.providers.intel import (
+    CTID_RAW,
+    CTID_TREE_API,
     HOSTNAME_RE,
     ExploitContext,
     FetchError,
@@ -26,6 +28,7 @@ from mcp_security_review.providers.intel import (
     fetch_bytes,
     fetch_epss,
     fetch_json,
+    load_ctid,
     load_kev,
     new_client,
     priority,
@@ -735,6 +738,139 @@ async def test_epss_uses_in_memory_cache(monkeypatch: pytest.MonkeyPatch) -> Non
     assert calls == 1
 
 
+# ---- CTID ----
+
+
+def _ctid_listing(names: list[str]) -> list[dict[str, str]]:
+    return [{"name": name, "type": "dir"} for name in names]
+
+
+def _ctid_handler(
+    *,
+    versions: list[str],
+    snapshots: list[str],
+    version: str,
+    snapshot: str,
+    mapping: dict[str, object],
+) -> Callable[[httpx.Request], httpx.Response]:
+    mapping_url = (
+        f"{CTID_RAW}/{version}/{snapshot}/enterprise/"
+        f"{snapshot}_{version}-enterprise.json"
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        if url == CTID_TREE_API:
+            return httpx.Response(200, json=_ctid_listing(versions))
+        if url == f"{CTID_TREE_API}/{version}":
+            return httpx.Response(200, json=_ctid_listing(snapshots))
+        if url == mapping_url:
+            return httpx.Response(200, json=mapping)
+        return httpx.Response(404)
+
+    return handler
+
+
+CTID_FIXTURE: dict[str, object] = {
+    "mapping_objects": [
+        {"capability_id": "CVE-2021-44228", "attack_object_id": "T1190"},
+        {"capability_id": "CVE-2021-44228", "attack_object_id": "T1059.001"},
+        {"capability_id": "CVE-2020-0001", "attack_object_id": "T1133"},
+    ]
+}
+
+
+@pytest.mark.anyio
+async def test_discovers_newest_version_and_snapshot(tmp_path: Path) -> None:
+    handler = _ctid_handler(
+        versions=["attack-15.1", "attack-16.1"],
+        snapshots=["kev-01.02.2025", "kev-07.28.2025"],
+        version="attack-16.1",
+        snapshot="kev-07.28.2025",
+        mapping=CTID_FIXTURE,
+    )
+    cache = IntelCache(tmp_path / "cache")
+    async with _client(handler) as c:
+        mapping = await load_ctid(c, cache)
+    assert mapping.attack_version == "attack-16.1"
+    assert mapping.snapshot == "kev-07.28.2025"
+
+
+@pytest.mark.anyio
+async def test_maps_cve_to_techniques(tmp_path: Path) -> None:
+    handler = _ctid_handler(
+        versions=["attack-16.1"],
+        snapshots=["kev-07.28.2025"],
+        version="attack-16.1",
+        snapshot="kev-07.28.2025",
+        mapping=CTID_FIXTURE,
+    )
+    cache = IntelCache(tmp_path / "cache")
+    async with _client(handler) as c:
+        mapping = await load_ctid(c, cache)
+    assert sorted(mapping.by_cve["CVE-2021-44228"]) == ["T1059.001", "T1190"]
+    assert mapping.by_cve["CVE-2020-0001"] == ["T1133"]
+
+
+@pytest.mark.anyio
+async def test_bad_technique_ids_dropped(tmp_path: Path) -> None:
+    fixture = {
+        "mapping_objects": [
+            {"capability_id": "CVE-2021-44228", "attack_object_id": "T1190"},
+            {"capability_id": "CVE-2021-44228", "attack_object_id": None},
+            {"capability_id": "CVE-2021-44228", "attack_object_id": ""},
+            {"capability_id": "CVE-2021-44228", "attack_object_id": "bogus"},
+            {"capability_id": "CVE-2021-44228", "attack_object_id": "T12345"},
+            {"capability_id": None, "attack_object_id": "T1059.001"},
+        ]
+    }
+    handler = _ctid_handler(
+        versions=["attack-16.1"],
+        snapshots=["kev-07.28.2025"],
+        version="attack-16.1",
+        snapshot="kev-07.28.2025",
+        mapping=fixture,
+    )
+    cache = IntelCache(tmp_path / "cache")
+    async with _client(handler) as c:
+        mapping = await load_ctid(c, cache)
+    assert mapping.by_cve == {"CVE-2021-44228": ["T1190"]}
+
+
+@pytest.mark.anyio
+async def test_github_rate_limit_uses_stale_cache(tmp_path: Path) -> None:
+    cache = IntelCache(tmp_path / "cache")
+    cache.put(
+        "ctid",
+        {
+            "attack_version": "attack-16.1",
+            "snapshot": "kev-07.28.2025",
+            "by_cve": {"CVE-2021-44228": ["T1190"]},
+        },
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(403, headers={"x-ratelimit-remaining": "0"})
+
+    async with _client(handler) as c:
+        mapping = await load_ctid(c, cache, refresh=True)
+    assert mapping.attack_version == "attack-16.1"
+    assert mapping.snapshot == "kev-07.28.2025"
+    assert mapping.by_cve == {"CVE-2021-44228": ["T1190"]}
+
+
+@pytest.mark.anyio
+async def test_ctid_fetch_failure_without_cache_raises(tmp_path: Path) -> None:
+    cache = IntelCache(tmp_path / "cache")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(403, headers={"x-ratelimit-remaining": "0"})
+
+    async with _client(handler) as c:
+        with pytest.raises(FetchError):
+            await load_ctid(c, cache)
+
+
 # ---- Exploit context ----
 
 
@@ -788,10 +924,22 @@ async def test_build_exploit_contexts_happy_path(
 ) -> None:
     monkeypatch.setattr(intel, "_EPSS_CACHE", {})
     vuln = Vulnerability(id="CVE-2021-44228", summary="s", severity="critical")
+    version, snapshot = "attack-16.1", "kev-07.28.2025"
+    mapping_url = (
+        f"{CTID_RAW}/{version}/{snapshot}/enterprise/"
+        f"{snapshot}_{version}-enterprise.json"
+    )
 
     def handler(request: httpx.Request) -> httpx.Response:
-        if "known_exploited_vulnerabilities" in str(request.url):
+        url = str(request.url)
+        if "known_exploited_vulnerabilities" in url:
             return httpx.Response(200, json=KEV_FIXTURE)
+        if url == CTID_TREE_API:
+            return httpx.Response(200, json=_ctid_listing(["attack-16.1"]))
+        if url == f"{CTID_TREE_API}/{version}":
+            return httpx.Response(200, json=_ctid_listing([snapshot]))
+        if url == mapping_url:
+            return httpx.Response(200, json=CTID_FIXTURE)
         return httpx.Response(
             200,
             json={
@@ -817,5 +965,5 @@ async def test_build_exploit_contexts_happy_path(
     assert ctx.epss == 0.97
     assert ctx.epss_percentile == 0.99
     assert ctx.priority == "upgrade_now"
-    assert ctx.sources == {}
-    assert ctx.attack_techniques == []
+    assert ctx.sources == {"ctid": f"ok (snapshot {snapshot})"}
+    assert ctx.attack_techniques == [{"id": "T1059.001"}, {"id": "T1190"}]

@@ -693,6 +693,207 @@ async def fetch_epss(
     return result
 
 
+# ---- CTID ----
+
+CTID_TREE_API = (
+    "https://api.github.com/repos/center-for-threat-informed-defense/"
+    "mappings-explorer/contents/mappings/kev"
+)
+CTID_RAW = (
+    "https://raw.githubusercontent.com/center-for-threat-informed-defense/"
+    "mappings-explorer/main/mappings/kev"
+)
+_CTID_CACHE_KEY = "ctid"
+_CTID_TTL = timedelta(days=7)
+_CTID_LISTING_MAX_BYTES = 1 * 1024 * 1024
+_CTID_MAPPING_MAX_BYTES = 10 * 1024 * 1024
+
+_ATTACK_VERSION_RE = re.compile(r"^attack-(\d+)\.(\d+)$")
+_KEV_SNAPSHOT_RE = re.compile(r"^kev-(\d{2})\.(\d{2})\.(\d{4})$")
+_TECHNIQUE_ID_RE = re.compile(r"^T\d{4}(\.\d{3})?$")
+
+
+@dataclass
+class CtidMapping:
+    """A CTID KEV -> ATT&CK mapping snapshot.
+
+    Attributes:
+        attack_version: The ATT&CK version directory this came from, e.g.
+            `"attack-16.1"`.
+        snapshot: The KEV snapshot directory this came from, e.g.
+            `"kev-07.28.2025"`.
+        by_cve: ATT&CK technique ids (validated `^T\\d{4}(\\.\\d{3})?$`)
+            keyed by CVE id.
+    """
+
+    attack_version: str
+    snapshot: str
+    by_cve: dict[str, list[str]]
+
+
+def _newest_dir_name(entries: Any, pattern: re.Pattern[str], key: Any) -> str | None:
+    """Return the dir name matching `pattern` whose sort `key` is largest."""
+    if not isinstance(entries, list):
+        return None
+    best_key: Any = None
+    best_name: str | None = None
+    for entry in entries:
+        if not isinstance(entry, dict) or entry.get("type") != "dir":
+            continue
+        name = entry.get("name")
+        if not isinstance(name, str):
+            continue
+        match = pattern.fullmatch(name)
+        if not match:
+            continue
+        candidate_key = key(match)
+        if best_key is None or candidate_key > best_key:
+            best_key = candidate_key
+            best_name = name
+    return best_name
+
+
+def _newest_attack_version(entries: Any) -> str | None:
+    """Pick the highest `attack-X.Y` directory name, sorted numerically."""
+    return _newest_dir_name(
+        entries,
+        _ATTACK_VERSION_RE,
+        lambda m: (int(m.group(1)), int(m.group(2))),
+    )
+
+
+def _newest_kev_snapshot(entries: Any) -> str | None:
+    """Pick the most recent `kev-MM.DD.YYYY` directory name, sorted by date."""
+    return _newest_dir_name(
+        entries,
+        _KEV_SNAPSHOT_RE,
+        lambda m: (int(m.group(3)), int(m.group(1)), int(m.group(2))),
+    )
+
+
+def _parse_ctid_mapping(
+    data: Any, *, attack_version: str, snapshot: str
+) -> CtidMapping:
+    """Build a `CtidMapping` from a raw CTID mapping file payload."""
+    by_cve: dict[str, list[str]] = {}
+    objects = data.get("mapping_objects") if isinstance(data, dict) else None
+    if isinstance(objects, list):
+        for obj in objects:
+            if not isinstance(obj, dict):
+                continue
+            cve = obj.get("capability_id")
+            technique = obj.get("attack_object_id")
+            if not isinstance(cve, str) or not cve:
+                continue
+            if not isinstance(technique, str):
+                continue
+            if not _TECHNIQUE_ID_RE.fullmatch(technique):
+                continue
+            techniques = by_cve.setdefault(cve, [])
+            if technique not in techniques:
+                techniques.append(technique)
+    return CtidMapping(attack_version=attack_version, snapshot=snapshot, by_cve=by_cve)
+
+
+async def _discover_ctid(client: httpx.AsyncClient) -> CtidMapping:
+    """Discover the newest CTID KEV mapping snapshot and fetch it.
+
+    Makes two GitHub contents-API calls (the `kev` directory, then the
+    newest `attack-X.Y` directory inside it) plus one raw-content fetch for
+    the mapping file itself, whose name is constructed from the discovered
+    version and snapshot rather than listed.
+
+    Raises:
+        FetchError: A request failed, or no usable `attack-X.Y` or
+            `kev-MM.DD.YYYY` directory was found.
+    """
+    versions = await fetch_json(
+        client, CTID_TREE_API, max_bytes=_CTID_LISTING_MAX_BYTES
+    )
+    version = _newest_attack_version(versions)
+    if version is None:
+        raise FetchError("invalid_response", "no attack-X.Y directories found")
+
+    snapshots = await fetch_json(
+        client, f"{CTID_TREE_API}/{version}", max_bytes=_CTID_LISTING_MAX_BYTES
+    )
+    snapshot = _newest_kev_snapshot(snapshots)
+    if snapshot is None:
+        raise FetchError("invalid_response", "no kev-MM.DD.YYYY directories found")
+
+    mapping_url = (
+        f"{CTID_RAW}/{version}/{snapshot}/enterprise/"
+        f"{snapshot}_{version}-enterprise.json"
+    )
+    data = await fetch_json(client, mapping_url, max_bytes=_CTID_MAPPING_MAX_BYTES)
+    return _parse_ctid_mapping(data, attack_version=version, snapshot=snapshot)
+
+
+def _ctid_to_cache(mapping: CtidMapping) -> dict[str, Any]:
+    """Turn a `CtidMapping` into a JSON-serialisable dict for the cache."""
+    return {
+        "attack_version": mapping.attack_version,
+        "snapshot": mapping.snapshot,
+        "by_cve": mapping.by_cve,
+    }
+
+
+def _ctid_from_cache(data: Any) -> CtidMapping | None:
+    """Rebuild a `CtidMapping` from a cached value, or None if malformed."""
+    if not isinstance(data, dict):
+        return None
+    version = data.get("attack_version")
+    snapshot = data.get("snapshot")
+    by_cve = data.get("by_cve")
+    if not isinstance(version, str) or not isinstance(snapshot, str):
+        return None
+    if not isinstance(by_cve, dict):
+        return None
+    cleaned: dict[str, list[str]] = {}
+    for cve, techniques in by_cve.items():
+        if isinstance(cve, str) and isinstance(techniques, list):
+            cleaned[cve] = [t for t in techniques if isinstance(t, str)]
+    return CtidMapping(attack_version=version, snapshot=snapshot, by_cve=cleaned)
+
+
+async def load_ctid(
+    client: httpx.AsyncClient, cache: IntelCache, *, refresh: bool = False
+) -> CtidMapping:
+    """Load the CTID KEV -> ATT&CK mapping, caching it on disk for 7 days.
+
+    Args:
+        client: Client from `new_client`.
+        cache: Cache to read from and write to.
+        refresh: Skip the fresh-cache check and fetch unconditionally. A
+            failed fetch still falls back to a stale cached copy.
+
+    Returns:
+        The newest `CtidMapping` available.
+
+    Raises:
+        FetchError: The fetch failed and no cached copy, stale or fresh,
+            is available.
+    """
+    if not refresh:
+        cached = cache.get(_CTID_CACHE_KEY, _CTID_TTL)
+        if cached is not None:
+            parsed = _ctid_from_cache(cached)
+            if parsed is not None:
+                return parsed
+    try:
+        mapping = await _discover_ctid(client)
+    except FetchError:
+        stale = cache.get_stale(_CTID_CACHE_KEY)
+        if stale is not None:
+            stale_data, _fetched_at = stale
+            parsed = _ctid_from_cache(stale_data)
+            if parsed is not None:
+                return parsed
+        raise
+    cache.put(_CTID_CACHE_KEY, _ctid_to_cache(mapping))
+    return mapping
+
+
 # ---- Exploit context ----
 
 EPSS_UPGRADE_PERCENTILE = 0.9
@@ -733,14 +934,17 @@ class ExploitContext:
             EPSS could not be checked or had no score for any of them.
         epss_percentile: The percentile for `epss`, or `None`.
         attack_techniques: MITRE ATT&CK techniques linked to this
-            vulnerability. Empty for now; a later task fills this in with
-            CTID technique ids (and, after that, ATT&CK names) under
-            `sources["ctid"]`.
+            vulnerability via the CTID KEV mapping, as `{"id": <technique
+            id>}` (no `name` yet; a later task adds one from an ATT&CK name
+            index). Empty when CTID has no mapping for any of `cves`, or
+            when CTID could not be checked.
         priority: `"upgrade_now"`, `"check_reachability"`, or `"unknown"`
             (no CVE ids to look up).
         sources: Per-source status for sources that failed, e.g.
             `{"kev": "unavailable: timeout"}`. A source that succeeded is
-            absent from this mapping.
+            absent from this mapping, except `"ctid"`, which is always
+            present when `cves` is non-empty: `"ok (snapshot <snapshot>)"`
+            on success, `"unavailable: <code>"` on failure.
     """
 
     cves: list[str]
@@ -776,14 +980,16 @@ async def build_exploit_contexts(
 ) -> dict[str, ExploitContext]:
     """Build exploit context for each vulnerability, keyed by its id.
 
-    Looks up KEV membership and EPSS scores for every CVE id the given
-    vulnerabilities carry, in two calls shared across all of them, then
-    assembles one `ExploitContext` per vulnerability.
+    Looks up KEV membership, EPSS scores, and the CTID KEV -> ATT&CK
+    mapping for every CVE id the given vulnerabilities carry, in calls
+    shared across all of them, then assembles one `ExploitContext` per
+    vulnerability.
 
-    Never raises: a KEV or EPSS failure is recorded as
-    `sources["kev"]`/`sources["epss"]` (`"unavailable: <code>"`) and the
-    corresponding fields are left `None`, but the function still returns
-    a context for every vulnerability passed in.
+    Never raises: a KEV, EPSS, or CTID failure is recorded as
+    `sources["kev"]`/`sources["epss"]`/`sources["ctid"]`
+    (`"unavailable: <code>"`) and the corresponding fields are left `None`
+    or empty, but the function still returns a context for every
+    vulnerability passed in.
 
     Args:
         vulns: Vulnerabilities to build context for. Only `.id` and
@@ -791,8 +997,8 @@ async def build_exploit_contexts(
             shaped like one works.
         client: Client from `new_client`. A new one is created and closed
             when omitted.
-        cache: Cache for the KEV catalog. A default `IntelCache()` is used
-            when omitted.
+        cache: Cache for the KEV catalog and the CTID mapping. A default
+            `IntelCache()` is used when omitted.
 
     Returns:
         `ExploitContext` keyed by vulnerability id.
@@ -829,6 +1035,17 @@ async def build_exploit_contexts(
             except Exception:  # defensive: this helper must never raise
                 logger.exception("EPSS lookup failed")
                 epss_unavailable = "unavailable: error"
+
+        ctid_mapping: CtidMapping | None = None
+        ctid_unavailable: str | None = None
+        if all_cve_ids:
+            try:
+                ctid_mapping = await load_ctid(active_client, active_cache)
+            except FetchError as exc:
+                ctid_unavailable = f"unavailable: {exc.code}"
+            except Exception:  # defensive: this helper must never raise
+                logger.exception("CTID lookup failed")
+                ctid_unavailable = "unavailable: error"
 
         contexts: dict[str, ExploitContext] = {}
         for vuln in vulns:
@@ -871,6 +1088,16 @@ async def build_exploit_contexts(
             kev_flag = None if kev_unavailable is not None else kev_entry is not None
             pct = epss_entry.percentile if epss_entry is not None else None
 
+            attack_techniques: list[dict[str, str]] = []
+            if ctid_unavailable is not None:
+                sources["ctid"] = ctid_unavailable
+            elif ctid_mapping is not None:
+                sources["ctid"] = f"ok (snapshot {ctid_mapping.snapshot})"
+                technique_ids: set[str] = set()
+                for cve in cves:
+                    technique_ids.update(ctid_mapping.by_cve.get(cve, []))
+                attack_techniques = [{"id": tid} for tid in sorted(technique_ids)]
+
             contexts[vuln.id] = ExploitContext(
                 cves=cves,
                 kev=kev_flag,
@@ -878,6 +1105,7 @@ async def build_exploit_contexts(
                 kev_due_date=kev_entry.due_date if kev_entry else None,
                 epss=epss_entry.epss if epss_entry else None,
                 epss_percentile=pct,
+                attack_techniques=attack_techniques,
                 priority=priority(kev=kev_flag, pct=pct),
                 sources=sources,
             )
