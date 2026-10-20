@@ -9,6 +9,7 @@ from typing import Any
 import pytest
 
 from mcp_security_review.guard.clip import OMITTED
+from mcp_security_review.security import project_context
 from mcp_security_review.security.project_context import (
     MAX_FILE_BYTES,
     MAX_FILES,
@@ -31,6 +32,21 @@ def _strings(value: Any) -> list[str]:
     return []
 
 
+@pytest.fixture(params=["fwalk", "walk"])
+def walk_mode(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> str:
+    """Run a test with `os.fwalk` (POSIX) and with the `os.walk` fallback."""
+    if request.param == "walk":
+        monkeypatch.setattr(project_context, "_HAS_FWALK", False)
+
+        def no_fwalk(*args: Any, **kwargs: Any) -> Any:
+            raise AssertionError("os.fwalk used in the fallback")
+
+        monkeypatch.setattr(os, "fwalk", no_fwalk, raising=False)
+    elif not hasattr(os, "fwalk"):
+        pytest.skip("os.fwalk is not available on this platform")
+    return str(request.param)
+
+
 @pytest.fixture
 def stack(tmp_path: Path) -> Path:
     return make_stack50(tmp_path / "stack50")
@@ -44,6 +60,7 @@ def _line_of(path: Path, needle: str) -> int:
 # ---- detection ----
 
 
+@pytest.mark.usefixtures("walk_mode")
 def test_detects_the_stack(stack: Path) -> None:
     ctx = scan_project(stack)
 
@@ -58,6 +75,7 @@ def test_detects_the_stack(stack: Path) -> None:
     assert ctx.truncated is False
 
 
+@pytest.mark.usefixtures("walk_mode")
 def test_flags_unpinned_action_with_its_line(stack: Path) -> None:
     ctx = scan_project(stack)
 
@@ -71,6 +89,7 @@ def test_flags_unpinned_action_with_its_line(stack: Path) -> None:
     } in ctx.flags
 
 
+@pytest.mark.usefixtures("walk_mode")
 def test_sha_pinned_steps_are_not_flagged(stack: Path) -> None:
     ctx = scan_project(stack)
 
@@ -78,6 +97,7 @@ def test_sha_pinned_steps_are_not_flagged(stack: Path) -> None:
     assert not [f for f in ctx.flags if f["file"].endswith("semgrep.yml")]
 
 
+@pytest.mark.usefixtures("walk_mode")
 def test_flags_mutable_image_but_not_build_stages(stack: Path) -> None:
     ctx = scan_project(stack)
 
@@ -93,6 +113,7 @@ def test_flags_mutable_image_but_not_build_stages(stack: Path) -> None:
     ]
 
 
+@pytest.mark.usefixtures("walk_mode")
 def test_flags_module_without_version(stack: Path) -> None:
     ctx = scan_project(stack)
 
@@ -189,6 +210,7 @@ def test_detects_kubernetes_and_helm(tmp_path: Path) -> None:
     assert "kubernetes" in ctx.suggested_components
 
 
+@pytest.mark.usefixtures("walk_mode")
 def test_reads_existing_threat_model_headings(stack: Path) -> None:
     ctx = scan_project(stack)
 
@@ -201,6 +223,7 @@ def test_reads_existing_threat_model_headings(stack: Path) -> None:
 # ---- suggestions ----
 
 
+@pytest.mark.usefixtures("walk_mode")
 def test_suggests_components_for_the_stack(stack: Path) -> None:
     ctx = scan_project(stack)
 
@@ -240,6 +263,7 @@ def test_suggestions_only_use_known_components(stack: Path) -> None:
 # ---- boundaries ----
 
 
+@pytest.mark.usefixtures("walk_mode")
 def test_sensitive_files_are_listed_never_read(
     stack: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -269,6 +293,7 @@ def test_sensitive_files_are_listed_never_read(
     assert "do-not-read" not in json.dumps(ctx.to_dict())
 
 
+@pytest.mark.usefixtures("walk_mode")
 def test_symlinks_are_not_followed(stack: Path, tmp_path: Path) -> None:
     outside = tmp_path / "outside"
     outside.mkdir()
@@ -289,6 +314,7 @@ def test_symlinks_are_not_followed(stack: Path, tmp_path: Path) -> None:
     assert ctx.iac["terraform_providers"] == ["aws"]
 
 
+@pytest.mark.usefixtures("walk_mode")
 def test_huge_trees_are_truncated(tmp_path: Path) -> None:
     for i in range(MAX_FILES + 1000):
         (tmp_path / f"f{i}.txt").write_bytes(b"")

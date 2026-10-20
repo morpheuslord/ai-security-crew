@@ -238,6 +238,8 @@ _K8S_KIND = re.compile(r"^kind:[ \t]*\S", re.MULTILINE)
 _HEADING = re.compile(r"^##(?!#)(.*)$")
 _PROVIDER_SOURCE = re.compile(r"(?:[\w.-]+/)?[\w-]+/([\w-]+)")
 _WORKFLOW_ITEM_BUDGET = 10_000
+_HAS_FWALK = hasattr(os, "fwalk")
+"""`os.fwalk` is POSIX-only; elsewhere the scan falls back to `os.walk`."""
 
 
 class PathOutsideProjectError(ValueError):
@@ -330,8 +332,11 @@ def scan_project(
     return _Scanner(root, set(known_components)).run()
 
 
-def _lstat_is(name: str, dir_fd: int, kind: Callable[[int], bool]) -> bool:
-    """Whether `name` in `dir_fd` is of `kind` without following a symlink."""
+def _lstat_is(name: str, dir_fd: int | None, kind: Callable[[int], bool]) -> bool:
+    """Whether `name` is of `kind` without following a symlink.
+
+    `name` is relative to `dir_fd`, or a full path when `dir_fd` is None.
+    """
     try:
         return kind(os.stat(name, dir_fd=dir_fd, follow_symlinks=False).st_mode)
     except OSError:
@@ -488,6 +493,7 @@ class _Scanner:
         self.data_store = False
         self.threat_model_key: tuple[int, str] | None = None
         self.dir_fd: int | None = None
+        self.current_dir = root
 
     def run(self) -> ProjectContext:
         self._walk()
@@ -505,6 +511,12 @@ class _Scanner:
     # ---- walking and reading ----
 
     def _walk(self) -> None:
+        if _HAS_FWALK:
+            self._fwalk()
+        else:
+            self._walk_portable()
+
+    def _fwalk(self) -> None:
         """Walk with directory file descriptors so nothing can be swapped in.
 
         `os.fwalk` never descends into a symlinked directory, and every entry
@@ -521,14 +533,9 @@ class _Scanner:
                     if d not in SKIP_DIRS and _lstat_is(d, dir_fd, stat.S_ISDIR)
                 )
                 self.dir_fd = dir_fd
-                for name in sorted(filenames):
-                    if not _lstat_is(name, dir_fd, stat.S_ISREG):
-                        continue
-                    if self.files_seen >= MAX_FILES:
-                        self.ctx.truncated = True
-                        return
-                    self.files_seen += 1
-                    self._visit(name, (rel_dir / name).as_posix())
+                regular = [n for n in filenames if _lstat_is(n, dir_fd, stat.S_ISREG)]
+                if not self._visit_files(rel_dir, regular):
+                    return
         finally:
             # A generator: closing it releases the directory descriptors now
             # rather than when it is collected (typeshed types it Iterator).
@@ -536,11 +543,44 @@ class _Scanner:
             if callable(close):
                 close()
 
+    def _walk_portable(self) -> None:
+        """Walk with `os.walk` where `os.fwalk` does not exist (Windows).
+
+        Symlinked directories and files are skipped by `lstat` before use, and
+        files are opened with `O_NOFOLLOW` where the platform has it.
+        """
+        self.dir_fd = None
+        for dirpath, dirnames, filenames in os.walk(self.root, followlinks=False):
+            current = Path(dirpath)
+            dirnames[:] = sorted(
+                d
+                for d in dirnames
+                if d not in SKIP_DIRS
+                and _lstat_is(str(current / d), None, stat.S_ISDIR)
+            )
+            self.current_dir = current
+            regular = [
+                n for n in filenames if _lstat_is(str(current / n), None, stat.S_ISREG)
+            ]
+            if not self._visit_files(current.relative_to(self.root), regular):
+                return
+
+    def _visit_files(self, rel_dir: Path, names: list[str]) -> bool:
+        """Visit regular files in one directory; False once MAX_FILES is hit."""
+        for name in sorted(names):
+            if self.files_seen >= MAX_FILES:
+                self.ctx.truncated = True
+                return False
+            self.files_seen += 1
+            self._visit(name, (rel_dir / name).as_posix())
+        return True
+
     def _read(self, name: str) -> tuple[str, bool] | None:
         """Read a regular file in the current directory, within the caps.
 
-        The file is opened relative to the walked directory's descriptor with
-        `O_NOFOLLOW`, so a symlink swapped in after the walk listed it fails.
+        With `os.fwalk` the file is opened relative to the walked directory's
+        descriptor, and with `O_NOFOLLOW` wherever it exists, so a symlink
+        swapped in after the walk listed it fails to open.
 
         Returns:
             The text and whether all of it was read, or None if unreadable.
@@ -551,10 +591,14 @@ class _Scanner:
             return None
         limit = min(MAX_FILE_BYTES, remaining)
         flags = (
-            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+            os.O_RDONLY
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_NONBLOCK", 0)
+            | getattr(os, "O_BINARY", 0)
         )
+        target = name if self.dir_fd is not None else str(self.current_dir / name)
         try:
-            fd = os.open(name, flags, dir_fd=self.dir_fd)
+            fd = os.open(target, flags, dir_fd=self.dir_fd)
         except OSError:
             return None
         try:
