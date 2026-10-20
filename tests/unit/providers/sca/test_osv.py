@@ -10,7 +10,12 @@ from mcp_security_review.providers.sca.osv import (
     ScanResult,
     Vulnerability,
     VulnerableFunction,
+    level_for_score,
+    score_severity,
 )
+
+V3 = "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"
+V4 = "CVSS:4.0/AV:N/AC:L/AT:N/PR:H/UI:N/VC:L/VI:L/VA:N/SC:N/SI:N/SA:N"
 
 
 class TestVulnerableFunction:
@@ -284,3 +289,105 @@ class TestOSVScanner:
         assert len(funcs) == 1
         assert funcs[0].name == "template"
         assert funcs[0].module == "lodash"
+
+
+class TestScoreSeverity:
+    def test_v3_vector_only_scores_critical(self) -> None:
+        s = score_severity({"severity": [{"type": "CVSS_V3", "score": V3}]})
+        assert (s.level, s.score, s.source) == ("critical", 9.8, "cvss_v3")
+
+    def test_v3_vector_with_database_fallback_still_scores_vector(self) -> None:
+        s = score_severity(
+            {
+                "severity": [{"type": "CVSS_V3", "score": V3}],
+                "database_specific": {"severity": "CRITICAL"},
+            }
+        )
+        assert s.level == "critical" and s.source == "cvss_v3"
+
+    def test_v4_vector_with_fallback_scores_vector(self) -> None:
+        s = score_severity(
+            {
+                "severity": [{"type": "CVSS_V4", "score": V4}],
+                "database_specific": {"severity": "CRITICAL"},
+            }
+        )
+        assert s.source == "cvss_v4" and s.level == level_for_score(s.score)
+
+    def test_v4_vector_only_is_not_unknown(self) -> None:
+        s = score_severity({"severity": [{"type": "CVSS_V4", "score": V4}]})
+        assert s.level != "unknown" and s.score is not None
+
+    def test_v4_preferred_over_v3(self) -> None:
+        s = score_severity(
+            {
+                "severity": [
+                    {"type": "CVSS_V3", "score": V3},
+                    {"type": "CVSS_V4", "score": V4},
+                ]
+            }
+        )
+        assert s.source == "cvss_v4"
+
+    def test_malformed_vector_falls_back(self) -> None:
+        s = score_severity(
+            {
+                "severity": [{"type": "CVSS_V3", "score": "CVSS:3.1/AV:Q"}],
+                "database_specific": {"severity": "HIGH"},
+            }
+        )
+        assert (s.level, s.score, s.source) == ("high", None, "database_specific")
+
+    def test_moderate_maps_to_medium(self) -> None:
+        s = score_severity({"database_specific": {"severity": "MODERATE"}})
+        assert s.level == "medium"
+
+    def test_nothing_is_unknown(self) -> None:
+        s = score_severity({})
+        assert (s.level, s.score, s.vector, s.source) == ("unknown", None, None, "none")
+
+    def test_non_list_severity_does_not_raise(self) -> None:
+        s = score_severity({"severity": "x"})
+        assert s.level == "unknown"
+
+
+class TestLevelForScore:
+    def test_bands(self) -> None:
+        assert level_for_score(0.0) == "none"
+        assert level_for_score(0.1) == "low"
+        assert level_for_score(3.9) == "low"
+        assert level_for_score(4.0) == "medium"
+        assert level_for_score(6.9) == "medium"
+        assert level_for_score(7.0) == "high"
+        assert level_for_score(8.9) == "high"
+        assert level_for_score(9.0) == "critical"
+        assert level_for_score(10.0) == "critical"
+
+
+class TestParseVulnAliases:
+    def test_parse_vuln_keeps_aliases(self) -> None:
+        v = OSVScanner().parse_vuln(
+            {
+                "id": "GHSA-x",
+                "aliases": ["CVE-2024-1", "PYSEC-1"],
+                "severity": [{"type": "CVSS_V3", "score": V3}],
+            }
+        )
+        assert v.aliases == ["CVE-2024-1", "PYSEC-1"]
+        assert v.to_dict()["aliases"] == ["CVE-2024-1", "PYSEC-1"]
+        assert v.cve_ids() == ["CVE-2024-1"]
+        assert v.severity == "critical"
+        assert v.cvss_score == 9.8
+
+    def test_cve_ids_includes_own_id_when_cve_shaped(self) -> None:
+        v = OSVScanner().parse_vuln(
+            {"id": "CVE-2024-1", "aliases": ["GHSA-x", "CVE-2024-1"]}
+        )
+        assert v.cve_ids() == ["CVE-2024-1"]
+
+    def test_to_dict_omits_cvss_fields_when_unset(self) -> None:
+        v = Vulnerability(id="CVE-1", summary="Test", severity="low", aliases=[])
+        result = v.to_dict()
+        assert "cvss_score" not in result
+        assert "cvss_vector" not in result
+        assert result["aliases"] == []

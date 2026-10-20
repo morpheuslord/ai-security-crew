@@ -8,8 +8,11 @@ decide reachability.
 
 import asyncio
 import logging
+import re
 from dataclasses import dataclass, field
+from typing import Any
 
+import cvss
 import httpx
 
 from mcp_security_review.errors import error_body
@@ -18,6 +21,118 @@ logger = logging.getLogger(__name__)
 
 OSV_API_URL = "https://api.osv.dev/v1"
 OSV_QUERY_URL = f"{OSV_API_URL}/query"
+
+_CVE_ID_RE = re.compile(r"^CVE-\d{4}-\d{4,}$")
+
+# --- CVSS severity scoring -------------------------------------------------
+#
+# OSV records a CVSS vector string (not a numeric score) under
+# severity[].score. This section parses that vector with the `cvss`
+# package to get a base score, preferring CVSS v4 over v3, and falls back
+# to database_specific.severity only when no vector is present or the
+# vector fails to parse.
+
+_DATABASE_SEVERITY_LEVELS = {
+    "critical": "critical",
+    "high": "high",
+    "moderate": "medium",
+    "medium": "medium",
+    "low": "low",
+}
+
+
+@dataclass(frozen=True)
+class SeverityInfo:
+    """Resolved severity for a vulnerability record.
+
+    Attributes:
+        level: One of critical, high, medium, low, none, unknown.
+        score: The CVSS base score, when derived from a CVSS vector.
+        vector: The CVSS vector string that produced the score, if any.
+        source: Where the severity came from: cvss_v4, cvss_v3,
+            database_specific, or none.
+    """
+
+    level: str
+    score: float | None
+    vector: str | None
+    source: str
+
+
+def level_for_score(score: float) -> str:
+    """Map a CVSS base score (v3 or v4) to a severity level."""
+    if score <= 0.0:
+        return "none"
+    if score < 4.0:
+        return "low"
+    if score < 7.0:
+        return "medium"
+    if score < 9.0:
+        return "high"
+    return "critical"
+
+
+def score_severity(vuln_data: dict[str, Any]) -> SeverityInfo:
+    """Score an OSV vulnerability record's severity.
+
+    Prefers a CVSS v4 vector, then CVSS v3, then
+    `database_specific.severity`. Returns `level="unknown"` only when no
+    usable severity information is present at all.
+    """
+    severity_list = vuln_data.get("severity", [])
+    if not isinstance(severity_list, list):
+        severity_list = []
+
+    v3_vector: str | None = None
+    v4_vector: str | None = None
+    for sev in severity_list:
+        if not isinstance(sev, dict):
+            continue
+        sev_type = sev.get("type")
+        score_str = sev.get("score")
+        if not isinstance(score_str, str):
+            continue
+        if sev_type == "CVSS_V4":
+            v4_vector = score_str
+        elif sev_type == "CVSS_V3":
+            v3_vector = score_str
+
+    if v4_vector:
+        try:
+            base_score = float(cvss.CVSS4(v4_vector).base_score)
+            return SeverityInfo(
+                level=level_for_score(base_score),
+                score=base_score,
+                vector=v4_vector,
+                source="cvss_v4",
+            )
+        except (cvss.CVSSError, ValueError, KeyError, TypeError):
+            logger.debug("Unparseable CVSS v4 vector: %s", v4_vector)
+
+    if v3_vector:
+        try:
+            base_score = float(cvss.CVSS3(v3_vector).base_score)
+            return SeverityInfo(
+                level=level_for_score(base_score),
+                score=base_score,
+                vector=v3_vector,
+                source="cvss_v3",
+            )
+        except (cvss.CVSSError, ValueError, KeyError, TypeError):
+            logger.debug("Unparseable CVSS v3 vector: %s", v3_vector)
+
+    db_specific = vuln_data.get("database_specific", {})
+    if isinstance(db_specific, dict) and "severity" in db_specific:
+        raw = str(db_specific["severity"]).lower()
+        level = _DATABASE_SEVERITY_LEVELS.get(raw, "unknown")
+        return SeverityInfo(
+            level=level, score=None, vector=None, source="database_specific"
+        )
+
+    return SeverityInfo(level="unknown", score=None, vector=None, source="none")
+
+
+# --- end CVSS severity scoring ---------------------------------------------
 
 
 @dataclass
@@ -45,6 +160,23 @@ class Vulnerability:
     vulnerable_functions: list[VulnerableFunction] = field(default_factory=list)
     fixed_versions: list[str] = field(default_factory=list)
     references: list[str] = field(default_factory=list)
+    aliases: list[str] = field(default_factory=list)
+    cvss_score: float | None = None
+    cvss_vector: str | None = None
+
+    def cve_ids(self) -> list[str]:
+        """Return CVE identifiers for this vulnerability.
+
+        Includes `id` itself when it matches the CVE shape, plus any CVE
+        aliases, de-duplicated while keeping first-seen order.
+        """
+        ids: list[str] = []
+        if _CVE_ID_RE.match(self.id):
+            ids.append(self.id)
+        for alias in self.aliases:
+            if alias.startswith("CVE-") and alias not in ids:
+                ids.append(alias)
+        return ids
 
     def reachability_check(self) -> dict:
         """Build the question the calling agent answers about its own code."""
@@ -97,6 +229,11 @@ class Vulnerability:
             result["fixed_versions"] = self.fixed_versions
         if self.references:
             result["references"] = self.references
+        result["aliases"] = self.aliases
+        if self.cvss_score is not None:
+            result["cvss_score"] = self.cvss_score
+        if self.cvss_vector is not None:
+            result["cvss_vector"] = self.cvss_vector
         result["reachability_check"] = self.reachability_check()
         return result
 
@@ -233,72 +370,31 @@ class OSVScanner:
 
     def _parse_vulns(self, vulns_data: list[dict]) -> list[Vulnerability]:
         """Parse OSV vulnerability response into our dataclasses."""
-        vulnerabilities = []
-        for vuln_data in vulns_data:
-            vuln_id = vuln_data.get("id", "")
-            summary = vuln_data.get("summary", "")
-            severity = self._extract_severity(vuln_data)
-            affected_versions = self._extract_affected_versions(vuln_data)
-            vulnerable_functions = self._extract_vulnerable_functions(vuln_data)
-            fixed_versions = self._extract_fixed_versions(vuln_data)
-            references = self._extract_references(vuln_data)
+        return [self.parse_vuln(vuln_data) for vuln_data in vulns_data]
 
-            vulnerabilities.append(
-                Vulnerability(
-                    id=vuln_id,
-                    summary=summary,
-                    severity=severity,
-                    affected_versions=affected_versions,
-                    vulnerable_functions=vulnerable_functions,
-                    fixed_versions=fixed_versions,
-                    references=references,
-                )
-            )
-        return vulnerabilities
+    def parse_vuln(self, vuln_data: dict[str, Any]) -> Vulnerability:
+        """Parse a single OSV vulnerability record into a `Vulnerability`."""
+        severity_info = score_severity(vuln_data)
+        aliases = vuln_data.get("aliases", [])
+        if not isinstance(aliases, list):
+            aliases = []
+
+        return Vulnerability(
+            id=vuln_data.get("id", ""),
+            summary=vuln_data.get("summary", ""),
+            severity=severity_info.level,
+            affected_versions=self._extract_affected_versions(vuln_data),
+            vulnerable_functions=self._extract_vulnerable_functions(vuln_data),
+            fixed_versions=self._extract_fixed_versions(vuln_data),
+            references=self._extract_references(vuln_data),
+            aliases=aliases,
+            cvss_score=severity_info.score,
+            cvss_vector=severity_info.vector,
+        )
 
     def _extract_severity(self, vuln_data: dict) -> str:
         """Extract severity from OSV vulnerability data."""
-        severity_list = vuln_data.get("severity", [])
-        for sev in severity_list:
-            if sev.get("type") == "CVSS_V3":
-                score_str = sev.get("score", "")
-                # Parse CVSS vector for score
-                if "CVSS:" in score_str:
-                    return self._cvss_to_level(score_str)
-                return score_str
-
-        # Fallback: check database_specific
-        db_specific = vuln_data.get("database_specific", {})
-        if "severity" in db_specific:
-            return db_specific["severity"].lower()
-
-        return "unknown"
-
-    def _cvss_to_level(self, cvss_vector: str) -> str:
-        """Convert CVSS vector string to severity level.
-
-        Parses the base score from common CVSS v3 patterns.
-        """
-        # Try to find a numeric score in the vector
-        # CVSS vectors don't contain scores directly,
-        # but some APIs include them
-        parts = cvss_vector.split("/")
-        for part in parts:
-            if part.startswith("AV:"):
-                continue
-            try:
-                score = float(part)
-                if score >= 9.0:
-                    return "critical"
-                elif score >= 7.0:
-                    return "high"
-                elif score >= 4.0:
-                    return "medium"
-                else:
-                    return "low"
-            except ValueError:
-                continue
-        return "unknown"
+        return score_severity(vuln_data).level
 
     def _extract_affected_versions(self, vuln_data: dict) -> list[str]:
         """Extract affected version ranges."""
