@@ -21,7 +21,7 @@ from typing import Any
 
 import yaml
 
-from mcp_security_review.library.loader import _builtin_library
+from mcp_security_review.library import builtin_library
 from mcp_security_review.providers.intel import untrusted
 
 MAX_FILES = 2000
@@ -216,23 +216,25 @@ _SCANNER_PATTERN = re.compile(
 _COMPOSE_NAME = re.compile(r"^(docker-)?compose(\.[\w.-]+)?\.ya?ml$")
 _THREAT_MODEL_NAMES = {"threat-model.md", "threat_model.md", "threatmodel.md"}
 
-_USES_LINE = re.compile(r"""^\s*(?:-\s*)?uses:\s*["']?([^\s"'#]+)""")
-_SHA = re.compile(r"[0-9a-f]{40}")
+_USES_LINE = re.compile(
+    r"""^[ \t]*(?:-[ \t]*)?(?:\{(?:[^}]*?[, \t])?)?uses:[ \t]*["']?([^\s"'#,}]+)"""
+)
+_SHA = re.compile(r"[0-9a-fA-F]{40}")
 _FROM_LINE = re.compile(r"^\s*FROM\s+(.*)$", re.IGNORECASE)
 _MODULE_START = re.compile(r'^\s*module\s+"[^"]*"\s*\{')
 _MODULE_SOURCE = re.compile(r'\bsource\s*=\s*"([^"]*)"')
 _MODULE_VERSION = re.compile(r"\bversion\s*=")
-_GIT_REF_SHA = re.compile(r"[?&]ref=[0-9a-f]{40}(?:&|$)")
+_GIT_REF_SHA = re.compile(r"[?&]ref=[0-9a-fA-F]{40}(?:&|$)")
 _REGISTRY_SOURCE = re.compile(r"^(?:[\w.-]+/)?[\w-]+/[\w-]+/[\w-]+(?://\S*)?$")
 _REQUIRED_PROVIDER = re.compile(
     r'(?<![\w-])([\w-]+)\s*=\s*\{[^{}]*?\bsource\s*=\s*"([^"]+)"', re.DOTALL
 )
-_PROVIDER_BLOCK = re.compile(r'^\s*provider\s+"([\w-]+)"', re.MULTILINE)
-_RESOURCE_BLOCK = re.compile(r'^\s*(resource|data)\s+"([\w-]+)"', re.MULTILINE)
+_PROVIDER_BLOCK = re.compile(r'^[ \t]*provider[ \t]+"([\w-]+)"', re.MULTILINE)
+_RESOURCE_BLOCK = re.compile(r'^[ \t]*(resource|data)[ \t]+"([\w-]+)"', re.MULTILINE)
 _PROVIDER_NAME = re.compile(r"[a-z0-9][a-z0-9-]{0,40}")
 _REQUIREMENT_NAME = re.compile(r"\s*([A-Za-z0-9@][A-Za-z0-9._/@-]*)")
-_K8S_API = re.compile(r"^apiVersion:\s*\S", re.MULTILINE)
-_K8S_KIND = re.compile(r"^kind:\s*\S", re.MULTILINE)
+_K8S_API = re.compile(r"^apiVersion:[ \t]*\S", re.MULTILINE)
+_K8S_KIND = re.compile(r"^kind:[ \t]*\S", re.MULTILINE)
 _HEADING = re.compile(r"^##(?!#)(.*)$")
 _PROVIDER_SOURCE = re.compile(r"(?:[\w.-]+/)?[\w-]+/([\w-]+)")
 _WORKFLOW_ITEM_BUDGET = 10_000
@@ -324,8 +326,16 @@ def scan_project(
         The detected stack, IaC, CI, flags, and suggested components.
     """
     if known_components is None:
-        known_components = set(_builtin_library().components)
+        known_components = set(builtin_library().components)
     return _Scanner(root, set(known_components)).run()
+
+
+def _lstat_is(name: str, dir_fd: int, kind: Callable[[int], bool]) -> bool:
+    """Whether `name` in `dir_fd` is of `kind` without following a symlink."""
+    try:
+        return kind(os.stat(name, dir_fd=dir_fd, follow_symlinks=False).st_mode)
+    except OSError:
+        return False
 
 
 def _clip(text: str) -> str:
@@ -476,11 +486,11 @@ class _Scanner:
         self.terraform = False
         self.storage = False
         self.data_store = False
-        self.threat_models: list[tuple[int, str, Path]] = []
+        self.threat_model_key: tuple[int, str] | None = None
+        self.dir_fd: int | None = None
 
     def run(self) -> ProjectContext:
         self._walk()
-        self._read_threat_model()
         ctx = self.ctx
         ctx.languages = sorted(self.languages)
         ctx.package_managers = sorted(self.package_managers)
@@ -495,25 +505,42 @@ class _Scanner:
     # ---- walking and reading ----
 
     def _walk(self) -> None:
-        for dirpath, dirnames, filenames in os.walk(self.root, followlinks=False):
-            current = Path(dirpath)
-            dirnames[:] = sorted(
-                d
-                for d in dirnames
-                if d not in SKIP_DIRS and not (current / d).is_symlink()
-            )
-            for name in sorted(filenames):
-                path = current / name
-                if path.is_symlink():
-                    continue
-                if self.files_seen >= MAX_FILES:
-                    self.ctx.truncated = True
-                    return
-                self.files_seen += 1
-                self._visit(path, path.relative_to(self.root).as_posix(), name)
+        """Walk with directory file descriptors so nothing can be swapped in.
 
-    def _read(self, path: Path) -> tuple[str, bool] | None:
-        """Read a regular file without following a symlink, within the caps.
+        `os.fwalk` never descends into a symlinked directory, and every entry
+        is checked with `lstat` relative to its open parent, so a symlink
+        created during the scan is skipped rather than followed.
+        """
+        walker = os.fwalk(self.root, follow_symlinks=False)
+        try:
+            for dirpath, dirnames, filenames, dir_fd in walker:
+                rel_dir = Path(dirpath).relative_to(self.root)
+                dirnames[:] = sorted(
+                    d
+                    for d in dirnames
+                    if d not in SKIP_DIRS and _lstat_is(d, dir_fd, stat.S_ISDIR)
+                )
+                self.dir_fd = dir_fd
+                for name in sorted(filenames):
+                    if not _lstat_is(name, dir_fd, stat.S_ISREG):
+                        continue
+                    if self.files_seen >= MAX_FILES:
+                        self.ctx.truncated = True
+                        return
+                    self.files_seen += 1
+                    self._visit(name, (rel_dir / name).as_posix())
+        finally:
+            # A generator: closing it releases the directory descriptors now
+            # rather than when it is collected (typeshed types it Iterator).
+            close = getattr(walker, "close", None)
+            if callable(close):
+                close()
+
+    def _read(self, name: str) -> tuple[str, bool] | None:
+        """Read a regular file in the current directory, within the caps.
+
+        The file is opened relative to the walked directory's descriptor with
+        `O_NOFOLLOW`, so a symlink swapped in after the walk listed it fails.
 
         Returns:
             The text and whether all of it was read, or None if unreadable.
@@ -527,7 +554,7 @@ class _Scanner:
             os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
         )
         try:
-            fd = os.open(path, flags)
+            fd = os.open(name, flags, dir_fd=self.dir_fd)
         except OSError:
             return None
         try:
@@ -575,7 +602,7 @@ class _Scanner:
 
     # ---- classification ----
 
-    def _visit(self, path: Path, rel: str, name: str) -> None:
+    def _visit(self, name: str, rel: str) -> None:
         lower = name.lower()
         if _is_sensitive(lower):
             self._list(self.ctx.sensitive_files_present, rel)
@@ -595,44 +622,44 @@ class _Scanner:
         if lower in ("pyproject.toml", "pipfile") or (
             lower.startswith("requirements") and lower.endswith(".txt")
         ):
-            self._dependencies(path, lambda text: _python_requirements(lower, text))
+            self._dependencies(name, lambda text: _python_requirements(lower, text))
         elif lower == "package.json":
-            self._dependencies(path, _node_requirements)
+            self._dependencies(name, _node_requirements)
         elif lower.endswith(".tf"):
-            self._terraform(path, rel)
+            self._terraform(name, rel)
         elif (
             lower in ("dockerfile", "containerfile")
             or lower.startswith("dockerfile.")
             or lower.endswith(".dockerfile")
         ):
             self._list(self.ctx.iac["dockerfiles"], rel)
-            self._dockerfile(path, rel)
+            self._dockerfile(name, rel)
         elif parts[-3:-1] == [".github", "workflows"] and lower.endswith(
             (".yml", ".yaml")
         ):
             self.ci.add("github-actions")
-            self._workflow(path, rel)
+            self._workflow(name, rel)
         elif lower in _CI_FILES or parts[-2:] == [".circleci", "config.yml"]:
             self.ci.add(_CI_FILES.get(lower, "circleci"))
-            self._scanner_tokens(path)
+            self._scanner_tokens(name)
         elif lower == ".pre-commit-config.yaml":
-            self._scanner_tokens(path)
+            self._scanner_tokens(name)
         elif _COMPOSE_NAME.match(lower):
             self._list(self.ctx.iac["compose"], rel)
         elif lower == "chart.yaml":
             self._list(self.ctx.iac["helm"], rel)
         elif lower in _THREAT_MODEL_NAMES:
-            self.threat_models.append((len(parts), rel, path))
+            self._threat_model(name, rel, len(parts))
         elif lower.endswith((".yaml", ".yml")) and not lower.endswith("lock.yaml"):
-            self._maybe_kubernetes(path, rel)
+            self._maybe_kubernetes(name, rel)
 
         if lower in _SCANNER_CONFIGS:
             self.scanners.add(_SCANNER_CONFIGS[lower])
         elif ".semgrep" in parts[:-1]:
             self.scanners.add("semgrep")
 
-    def _dependencies(self, path: Path, parse: Callable[[str], list[str]]) -> None:
-        read = self._read(path)
+    def _dependencies(self, name: str, parse: Callable[[str], list[str]]) -> None:
+        read = self._read(name)
         if read is None:
             return
         for dep in parse(read[0]):
@@ -640,9 +667,9 @@ class _Scanner:
             if framework:
                 self.frameworks.add(framework)
 
-    def _terraform(self, path: Path, rel: str) -> None:
+    def _terraform(self, name: str, rel: str) -> None:
         self.terraform = True
-        read = self._read(path)
+        read = self._read(name)
         if read is None:
             return
         text = read[0]
@@ -684,8 +711,8 @@ class _Scanner:
                 if source and _module_unpinned(source[1], has_version=has_version):
                     self._flag("unpinned_module", rel, source[0], source[1])
 
-    def _dockerfile(self, path: Path, rel: str) -> None:
-        read = self._read(path)
+    def _dockerfile(self, name: str, rel: str) -> None:
+        read = self._read(name)
         if read is None:
             return
         stages: set[str] = set()
@@ -708,8 +735,8 @@ class _Scanner:
             if len(tokens) >= 3 and tokens[1].lower() == "as":
                 stages.add(tokens[2].lower())
 
-    def _workflow(self, path: Path, rel: str) -> None:
-        read = self._read(path)
+    def _workflow(self, name: str, rel: str) -> None:
+        read = self._read(name)
         if read is None:
             return
         text, complete = read
@@ -730,8 +757,8 @@ class _Scanner:
             if not _action_pinned(ref):
                 self._flag("unpinned_action", rel, number, ref)
 
-    def _scanner_tokens(self, path: Path) -> None:
-        read = self._read(path)
+    def _scanner_tokens(self, name: str) -> None:
+        read = self._read(name)
         if read is not None:
             self._tokens(read[0])
 
@@ -739,20 +766,22 @@ class _Scanner:
         for token in _SCANNER_PATTERN.findall(text.lower()):
             self.scanners.add(_SCANNER_TOKENS[token])
 
-    def _maybe_kubernetes(self, path: Path, rel: str) -> None:
-        read = self._read(path)
+    def _maybe_kubernetes(self, name: str, rel: str) -> None:
+        read = self._read(name)
         if read is None:
             return
         if _K8S_API.search(read[0]) and _K8S_KIND.search(read[0]):
             self._list(self.ctx.iac["kubernetes"], rel)
 
-    def _read_threat_model(self) -> None:
-        if not self.threat_models:
+    def _threat_model(self, name: str, rel: str, depth: int) -> None:
+        """Keep the headings of the shallowest threat model (then by name)."""
+        key = (depth, rel)
+        if self.threat_model_key is not None and key >= self.threat_model_key:
             return
-        _, rel, path = min(self.threat_models, key=lambda t: (t[0], t[1]))
-        read = self._read(path)
+        read = self._read(name)
         if read is None:
             return
+        self.threat_model_key = key
         headings: list[str] = []
         for line in _lines(read[0]):
             m = _HEADING.match(line)

@@ -351,3 +351,38 @@ async def test_project_context_clips_huge_workflow_lines(stack_cwd: Path) -> Non
 
     assert raw["truncated"] is True
     assert max(len(s) for s in strings(raw)) <= 200 + len(OMITTED)
+
+
+@pytest.mark.anyio
+async def test_project_context_uses_the_cwd_library_for_subpaths(
+    stack_cwd: Path,
+) -> None:
+    folder = stack_cwd / ".ai-security-crew" / "library"
+    folder.mkdir(parents=True)
+    (folder / "team.yaml").write_text("disable: [cloud-compute]\n", encoding="utf-8")
+
+    data = await project_context(path="infra")
+
+    assert data["success"] is True
+    assert "library_warning" not in data
+    assert "cloud-network" in data["suggested_components"]
+    assert "cloud-compute" not in data["suggested_components"]
+
+
+@pytest.mark.anyio
+async def test_project_context_survives_an_unreadable_project_library(
+    stack_cwd: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (stack_cwd / ".ai-security-crew" / "library").mkdir(parents=True)
+
+    def denied(self: Path) -> Any:
+        raise PermissionError(13, "Permission denied", str(self))
+
+    monkeypatch.setattr(Path, "iterdir", denied)
+
+    data = await project_context()
+
+    assert data["success"] is True
+    assert data["library_warning"]
+    assert "cloud-compute" in data["suggested_components"]
+    assert str(stack_cwd) not in json.dumps(data)

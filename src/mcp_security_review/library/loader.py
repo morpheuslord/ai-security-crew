@@ -130,6 +130,18 @@ def check_references(library: Library) -> None:
         raise LibraryError(errors)
 
 
+def builtin_library() -> Library:
+    """Return the built-in library alone, ignoring any project files.
+
+    Returns:
+        The validated built-in library (loaded once and cached).
+
+    Raises:
+        LibraryError: If the packaged library files are invalid.
+    """
+    return _builtin_library()
+
+
 @lru_cache(maxsize=1)
 def _builtin_library() -> Library:
     errors: list[str] = []

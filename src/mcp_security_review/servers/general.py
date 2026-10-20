@@ -405,20 +405,21 @@ def _library_is_symlinked(root: Path) -> bool:
     return folder.is_dir() and any(p.is_symlink() for p in folder.iterdir())
 
 
-def _scan_with_library(root: Path) -> tuple[ProjectContext, str | None]:
-    """Scan `root`, limiting suggestions to the ids in its threat library.
+def _scan_with_library(root: Path, project: Path) -> tuple[ProjectContext, str | None]:
+    """Scan `root`, limiting suggestions to the ids in the project's library.
 
-    Blocking file I/O: run it in a worker thread.
+    The library comes from `project` (the server's working directory), not
+    from the scanned folder. Blocking file I/O: run it in a worker thread.
     """
     warning = (
-        "The project's .ai-security-crew/library/ files are invalid or "
-        "symlinked, so suggestions use the built-in library."
+        "The project's .ai-security-crew/library/ files are invalid, symlinked, "
+        "or unreadable, so suggestions use the built-in library."
     )
-    if _library_is_symlinked(root):
-        return scan_project(root), warning
     try:
-        known = set(load_library(root).components)
-    except LibraryError:
+        if _library_is_symlinked(project):
+            return scan_project(root), warning
+        known = set(load_library(project).components)
+    except (LibraryError, OSError):
         return scan_project(root), warning
     return scan_project(root, known_components=known), None
 
@@ -480,8 +481,9 @@ async def project_context(
             "empty.",
         )
 
-    found, warning = await anyio.to_thread.run_sync(_scan_with_library, root)
-    relative = root.relative_to(cwd.resolve()).as_posix()
+    project = cwd.resolve()
+    found, warning = await anyio.to_thread.run_sync(_scan_with_library, root, project)
+    relative = root.relative_to(project).as_posix()
     response: dict[str, object] = {
         "success": True,
         "root": untrusted(relative, LINE_LIMIT),

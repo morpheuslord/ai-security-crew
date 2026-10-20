@@ -10,6 +10,7 @@ import pytest
 
 from mcp_security_review.guard.clip import OMITTED
 from mcp_security_review.security.project_context import (
+    MAX_FILE_BYTES,
     MAX_FILES,
     PathOutsideProjectError,
     ProjectPathNotFoundError,
@@ -329,6 +330,64 @@ def test_pathological_files_scan_quickly(tmp_path: Path) -> None:
     assert time.monotonic() - start < 5
     assert ctx.existing_threat_model is not None
     assert len(ctx.existing_threat_model["headings"][0]) <= 200 + len(OMITTED)
+
+
+@pytest.mark.parametrize(
+    "body", ["\n" * MAX_FILE_BYTES, " \n" * (MAX_FILE_BYTES // 2)], ids=["nl", "sp-nl"]
+)
+def test_blank_line_floods_scan_quickly(tmp_path: Path, body: str) -> None:
+    workflows = tmp_path / ".github" / "workflows"
+    workflows.mkdir(parents=True)
+    (tmp_path / "main.tf").write_text(body, encoding="utf-8")
+    (workflows / "w.yml").write_text(body, encoding="utf-8")
+    (tmp_path / "Dockerfile").write_text(body, encoding="utf-8")
+    (tmp_path / "app.yaml").write_text(body, encoding="utf-8")
+
+    start = time.monotonic()
+    ctx = scan_project(tmp_path)
+
+    assert time.monotonic() - start < 10
+    assert ctx.flags == []
+
+
+def test_flow_style_steps_are_flagged(tmp_path: Path) -> None:
+    workflows = tmp_path / ".github" / "workflows"
+    workflows.mkdir(parents=True)
+    (workflows / "w.yml").write_text(
+        "jobs:\n"
+        "  a:\n"
+        "    steps:\n"
+        "      - {uses: actions/checkout@v4}\n"
+        "      - {name: setup, uses: 'actions/setup-node@v4', with: {x: 1}}\n",
+        encoding="utf-8",
+    )
+
+    ctx = scan_project(tmp_path)
+
+    assert [(f["ref"], f["line"]) for f in ctx.flags] == [
+        ("actions/checkout@v4", 4),
+        ("actions/setup-node@v4", 5),
+    ]
+
+
+def test_uppercase_sha_counts_as_pinned(tmp_path: Path) -> None:
+    workflows = tmp_path / ".github" / "workflows"
+    workflows.mkdir(parents=True)
+    (workflows / "w.yml").write_text(
+        "jobs:\n  a:\n    steps:\n"
+        f"      - uses: actions/checkout@{STACK50_SHA.upper()}\n",
+        encoding="utf-8",
+    )
+
+    assert scan_project(tmp_path).flags == []
+
+
+def test_special_files_are_skipped_without_blocking(tmp_path: Path) -> None:
+    os.mkfifo(tmp_path / "Dockerfile")
+
+    ctx = scan_project(tmp_path)
+
+    assert ctx.iac["dockerfiles"] == []
 
 
 def test_flags_are_capped(tmp_path: Path) -> None:
